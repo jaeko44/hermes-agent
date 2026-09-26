@@ -767,43 +767,56 @@ def _bot_chat_turn_reported_a_digest(result, report_file: Optional[str] = None) 
     A turn cut by ``--max-turns`` does not fail — it ends as a RESUMABLE BOUNDARY carrying a
     summary of the work it completed. The platform's own ``is_max_iteration_handoff``
     (agent/turn_failure_copy.py:146) defines exactly that, and the JOB lane already delivers such
-    a summary instead of failing the run (cron/scheduler.py:2015, #102213). This lane has no
-    access to the child's result dict, so it must read the same verdict off the evidence it has:
-    a reply, and no error.
+    a summary instead of failing the run (cron/scheduler.py:2015, #102213).
 
     Without this, booking on ``returncode`` alone DROPS a digest that already reached Bot Chat —
     the very class this lane exists to stop, just relabelled from "timed out" to "exit code 1".
     Measured on this host: ``--max-turns 1`` posted a 1624-char "1/40, cut off" digest into the
     chat and reported ``exit_code=1`` with an EMPTY error.
 
-    Evidence is POSITIVE only, and both halves are corroborated:
-      * ``stdout`` non-empty — the answer, booked from the turn report
-        (``quiet_single_query.run_reported_turn`` maps the report's ``reply`` to stdout and its
-        ``error`` to stderr for a child that outlived its report);
-      * ``stderr`` empty — a child that reported its turn carries no error text, while one that
-        exited on its own always writes the resume banner to stderr, so a real failure can never
-        satisfy this;
-      * the report file itself, when still readable, must agree (empty ``error``, non-empty
-        ``reply``) — so a stale or foreign record cannot authorize the forgiveness.
-    Anything else (no answer, an error, an unreadable report) falls through to the failure path.
+    THE EVIDENCE IS THE CHILD'S OWN PID-CHECKED TURN REPORT — not stderr.
+
+    An earlier cut of this rule also required ``result.stderr`` to be empty, which is
+    unreachable on the path that matters. ``run_reported_turn`` returns two ways, and a
+    delivery child with nothing pending exits at once, so the ``:135`` return (the child's REAL
+    streams) is the common one — and ``-Q`` unconditionally writes to stderr: the
+    ``session_id:`` line (cli_single_query.py:284) and the ``↻ Resumed session`` banner
+    (cli_agent_setup_mixin.py:607). Empty stderr holds only on the rare lingering return
+    (``quiet_single_query.py:154``), where the streams ARE the report's own fields. So the rule
+    fired almost never, and a capped-but-answered turn was booked ``delivery_failed`` with its
+    digest already in the chat — the failure this rule exists to prevent, relabelled from
+    "timed out after 1800s" to "exit code 1".
+
+    ``read_turn_report`` is the authoritative, attributable read: the child writes the record
+    itself (``write_turn_report``) the moment the turn ends, and the reader accepts only a record
+    carrying THIS spawner's nonce (``TURN_REPORT_NONCE_ENV``), so a stale or foreign record can
+    never authorize a forgiveness. ``ReportedTurn`` carries that nonce on BOTH returns precisely
+    so this decision is identical regardless of which one booked the child.
+
+    The nonce, not the pid: on Windows the launcher RE-SPAWNS the CLI
+    (``hermes_bootstrap`` -> ``subprocess.call``), so the record's writer is a grandchild and its
+    pid never equals the launched one. Measured here on a real cap-cut child: the lane saw
+    ``child_pid=34716`` while the report carried ``pid=48108`` — a pid check matches NOTHING on
+    this platform, and a gate that can never fire is the same false negative as no gate at all.
+
+    Positive only: the report must exist, carry no ``error``, and carry a non-empty ``reply``.
+    Everything else — no answer, a provider error, an absent/corrupt/foreign report, or a child
+    that ended without reporting its turn — falls through to the failure path and blotters.
     """
     if getattr(result, "returncode", 0) == 0:
         return False
-    answer = _bot_chat_answer_text(getattr(result, "stdout", None))
-    if not answer or (getattr(result, "stderr", None) or "").strip():
+    report_file = report_file or getattr(result, "report_file", None)
+    nonce = getattr(result, "report_nonce", None)
+    if not report_file or not nonce:
         return False
-    if report_file:
-        import json as _json
-        try:
-            with open(report_file, encoding="utf-8-sig") as fh:
-                record = _json.load(fh)
-        except (OSError, ValueError):
-            return False
-        if not isinstance(record, dict):
-            return False
-        if str(record.get("error") or "").strip() or not str(record.get("reply") or "").strip():
-            return False
-    return True
+    from hermes_cli.quiet_single_query import read_turn_report
+
+    record = read_turn_report(report_file, nonce=nonce)
+    if not record:
+        return False
+    if str(record.get("error") or "").strip():
+        return False
+    return bool(str(record.get("reply") or "").strip())
 
 
 def _run_bot_chat_turn(argv: list, env: dict, report_path: str, timeout: float) -> subprocess.CompletedProcess:
