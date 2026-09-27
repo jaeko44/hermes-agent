@@ -66,8 +66,51 @@ _CANDIDATE_QUARANTINE_TTL: dict[str, Optional[float]] = {
     "invalid provider response": _TRANSIENT_CANDIDATE_QUARANTINE_SECONDS,
 }
 
+# A declared reset shorter than this is indistinguishable from the 60s blip hold, so the table
+# answers for it; longer than the cap, the hold saturates (see declared_reset_quarantine_ttl).
+_MIN_DECLARED_RESET_QUARANTINE_SECONDS = 300.0
+_MAX_DECLARED_RESET_QUARANTINE_SECONDS = 24 * 3600.0
 
-def fallback_candidate_quarantine_ttl(reason: Optional[str]) -> Optional[float]:
+
+def declared_reset_quarantine_ttl(exc: Optional[Exception]) -> Optional[float]:
+    """Seconds to hide a lane the provider itself said is out for a while, or None.
+
+    The per-reason table below assumes a 429 is a per-minute blip. It is not always one: a
+    quota EXHAUSTION is also a 429, and providers declare the real window (Retry-After,
+    ``resets_at``/``resets_in_seconds``, x-ratelimit-reset, or a duration in the message). The
+    main path has always sized its primary cooldown from that declaration
+    (``agent/fallback_cooldown.py`` -> ``extract_api_error_context``); the aux quarantine did
+    not, so an exhausted tier was re-probed once a minute for the entire window — 881 wasted
+    calls + log lines against opencode-go's monthly quota over 2026-09-19..27 while the main
+    agent correctly waited ~21 days. Reuse the same extractor so both layers read one clock.
+
+    Capped at 24h: a long window still deserves a periodic real probe (the key may be topped
+    up, or the window may be mis-declared), and a cap bounds how stale the decision can get.
+    """
+    if exc is None:
+        return None
+    try:
+        from agent.agent_runtime_helpers import extract_api_error_context
+        from agent.fallback_cooldown import _provider_reset_delay
+        delay = _provider_reset_delay(extract_api_error_context(exc).get("reset_at"))
+    except Exception:  # noqa: BLE001 - a missing extractor must not change quarantine behaviour
+        return None
+    if delay is None or delay < _MIN_DECLARED_RESET_QUARANTINE_SECONDS:
+        return None
+    return min(delay, _MAX_DECLARED_RESET_QUARANTINE_SECONDS)
+
+
+def fallback_candidate_quarantine_ttl(
+    reason: Optional[str], exc: Optional[Exception] = None,
+) -> Optional[float]:
     """Seconds to hide a fallback candidate for ``reason`` (a ``_FALLBACK_REASONS`` label, or None
-    for a stale credential); None means the long default TTL."""
+    for a stale credential); None means the long default TTL.
+
+    A provider-declared reset outranks the table: "rate limit" means 60s only when the provider
+    said nothing about how long. ``exc`` is the failure that produced ``reason``; callers that
+    have it must pass it, or an exhausted lane is re-probed every minute until it recovers.
+    """
+    declared = declared_reset_quarantine_ttl(exc)
+    if declared is not None:
+        return declared
     return _CANDIDATE_QUARANTINE_TTL.get(reason or "")
