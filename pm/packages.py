@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+from pm._subprocess_windows import hidden_spawn_kwargs
 from pm.package import (
     DebPackage,
     InstallError,
@@ -101,6 +102,7 @@ class BinaryPackage(Package):
                 timeout=60,
                 cwd=str(binary.parent) if self.probe_cwd else None,
                 env=self._probe_env(),
+                **hidden_spawn_kwargs(),
             )
         except OSError as e:
             return f"could not exec {binary} {' '.join(self.probe_args)}: {e}"
@@ -591,6 +593,7 @@ class Npm(BinaryPackage):
                 text=True,
                 timeout=900,
                 env=npm_env(Path(cache)),
+                **hidden_spawn_kwargs(),
             )
         if proc.returncode != 0:
             raise InstallError(

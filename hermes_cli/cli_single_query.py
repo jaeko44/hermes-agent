@@ -189,13 +189,16 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     from agent.turn_author import take_turn_author_from_env
     from hermes_cli.quiet_single_query import (
         adopt_unanswered_turn, bind_quiet_session_key, continue_quiet_notify_completions,
-        exit_single_query, quiet_notify_linger_seconds, take_turn_report_path, write_turn_report,
+        exit_single_query, quiet_notify_linger_seconds, take_turn_report_nonce, take_turn_report_path,
+        write_turn_report,
     )
 
     author = take_turn_author_from_env()
     # A spawner that bounds only the turn (cron Bot Chat lane) learns the outcome from this
     # report, written before the linger below; popped so tool subprocesses do not inherit it.
     turn_report_path = take_turn_report_path()
+    # ...and it only acts on a report carrying ITS nonce, so the pair is taken together.
+    turn_report_nonce = take_turn_report_nonce()
     # A dispatcher's re-run of a failed bot delivery resumes the DM row its first attempt persisted.
     adopt_unanswered_turn(cli, effective_query)
     author_kwargs = {"turn_author": author} if author is not None and _accepts_keyword(cli.agent.run_conversation, "turn_author") else {}
@@ -222,6 +225,7 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
                 turn_report_path, exit_code=_single_query_exit_code(res),
                 error=str(res.get("error") or "") if isinstance(res, dict) else "agent turn did not run",
                 reply=res.get("final_response", "") if isinstance(res, dict) else str(res),
+                nonce=turn_report_nonce or "",
             )
 
         _report_turn(result)

@@ -20,6 +20,10 @@ import sys
 import time
 from typing import IO, Callable, Mapping, Optional, Protocol, Sequence
 
+# Stdlib-only like the rest of this module: pm._subprocess_windows imports `sys` and
+# nothing else, so the pre-3.11 bootstrap runner can still import it.
+from pm._subprocess_windows import hidden_spawn_kwargs
+
 TAIL_LINES = 80
 # A child that never prints a newline (a bare progress stream, a binary blob) must not
 # grow memory without bound; the end of an over-long line is the informative part.
@@ -141,13 +145,13 @@ def run_contained(command: Sequence[str], label: str, *, stream: Optional[IO[str
         out = sys.stdout if stream is None else stream
         out.write(f"{indent}→ {label}…\n")
         out.flush()
-        return subprocess.run(command, check=True, **kwargs)
+        return subprocess.run(command, check=True, **hidden_spawn_kwargs(), **kwargs)
     tail = LiveTail(label, stream, hide=hide, indent=indent)
     captured = dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                     encoding="utf-8", errors="replace")
     if not tail.live:
         try:
-            result = subprocess.run(command, check=True, **captured, **kwargs)
+            result = subprocess.run(command, check=True, **captured, **hidden_spawn_kwargs(), **kwargs)
         except subprocess.CalledProcessError as exc:
             tail.write(exc.output or "")
             tail.close(False)
@@ -158,7 +162,7 @@ def run_contained(command: Sequence[str], label: str, *, stream: Optional[IO[str
         tail.close(True)
         return result
     try:
-        with subprocess.Popen(command, **captured, **kwargs) as proc:
+        with subprocess.Popen(command, **captured, **hidden_spawn_kwargs(), **kwargs) as proc:
             assert proc.stdout is not None  # stdout=PIPE above.
             for line in proc.stdout:
                 tail.write(line)

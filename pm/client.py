@@ -10,6 +10,7 @@ import threading
 import uuid
 
 from pm import paths, plugin_inputs
+from pm._subprocess_windows import hidden_spawn_kwargs
 from pm.package import InstallError, Runner, StatePackage
 from pm.plugin_inputs import Candidates, Members, PluginInput, Selection
 from pm.runtime import is_runtime, runtime_command, runtime_environment
@@ -114,7 +115,8 @@ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_
     write_lock = threading.Lock()
     monitor = None
     with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          text=True, encoding="utf-8", env=environment) as process:
+                          text=True, encoding="utf-8", env=environment,
+                          **hidden_spawn_kwargs()) as process:
         assert process.stdin is not None and process.stdout is not None
         writer = process.stdin
 

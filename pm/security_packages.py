@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 
+from pm._subprocess_windows import hidden_spawn_kwargs
 from pm import paths
 from pm.lock import Lockfile
 from pm.package import InstallError
@@ -139,11 +140,13 @@ class IronProxy(_SignedBinary):
             if not signature.is_file() or not key.is_file():
                 raise InstallError(self.name, "pinned signature assets missing")
             imported = subprocess.run([*args, "--import", str(key)], stdin=subprocess.DEVNULL,
-                                      capture_output=True, timeout=60, check=False)
+                                      capture_output=True, timeout=60, check=False,
+                                      **hidden_spawn_kwargs())
             if imported.returncode:
                 logging.getLogger(__name__).warning("Could not import iron-proxy signing key; archive checksum remains enforced")
                 return
             verified = subprocess.run([*args, "--verify", str(signature), str(directory / "checksums.txt")],
-                                      stdin=subprocess.DEVNULL, capture_output=True, timeout=60, check=False)
+                                      stdin=subprocess.DEVNULL, capture_output=True, timeout=60, check=False,
+                                      **hidden_spawn_kwargs())
             if verified.returncode:
                 raise InstallError(self.name, "GPG signature verification failed")

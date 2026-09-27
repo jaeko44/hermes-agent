@@ -699,6 +699,30 @@ def _get_bot_chat_delivery_timeout() -> int:
         return 600
 
 
+def _get_bot_chat_delivery_max_turns() -> int:
+    """Turn bound for one bot-chat delivery turn; ``cron.bot_chat_delivery_max_turns``, default 40.
+
+    The delivery child is a FULL agent turn: the injected message says "act on anything that
+    needs action", so it WORKS, and the resumed Bot Chat session is re-sent on every delivery. It
+    used to carry no bound of its own, so a turn that kept working ran until
+    ``bot_chat_delivery_timeout_seconds`` killed it — and a killed turn loses the digest it was
+    sent to post (web-frontend ``1eaff7eda25a`` 2026-09-27: 138.046s body + the 1800s cap =
+    1938.046s exactly, 74 tool calls, ``delivery_outcome=failed`` and the result dropped).
+
+    Sized from the fleet's own terminal deliveries rather than invented: delivered turns topped
+    out at 44 tool calls (n=48), while the cap-killed ones ran to 74. Exhausting the bound asks
+    the model for a summary and ends the turn, so a runaway REPORTS instead of dying. The
+    derived ``--run-budget`` (see the spawn site) keeps the child's own last call from hanging to
+    the wall-clock kill. 0 or negative disables the bound (the previous unbounded behaviour).
+    """
+    try:
+        cfg = _sched.load_config()
+        value = int(cfg.get("cron", {}).get("bot_chat_delivery_max_turns", 40))
+        return value if value > 0 else 0
+    except Exception:
+        return 40
+
+
 def _get_standalone_send_timeout() -> int:
     """Wall-clock bound for one standalone-lane send (#115469).
 
@@ -721,6 +745,78 @@ _BOT_CHAT_STDERR_TAIL = 500
 # stdout is the model's answer; only a short tail is persisted (jobs.json / ledger).
 _BOT_CHAT_STDOUT_TAIL = 200
 _BOT_CHAT_BANNER_PREFIXES = ("Resumed session", "session_id:")
+
+
+def _bot_chat_answer_text(stream) -> str:
+    """Strip ``-Q``'s resume banner lines from a child stream; what remains is the answer.
+
+    The banner (``↻ Resumed session …`` / ``session_id: …``) rides stderr on a child that
+    exits on its own and stdout on some provider paths (#104056), so both readers drop it the
+    same way: ONE rule, so a banner-only stream can never read as an answer in one place and
+    as noise in the other.
+    """
+    return "\n".join(
+        line for line in (stream or "").splitlines()
+        if line.strip() and not line.strip().lstrip("↻ ").startswith(_BOT_CHAT_BANNER_PREFIXES)
+    ).strip()
+
+
+def _bot_chat_turn_reported_a_digest(result, report_file: Optional[str] = None) -> bool:
+    """True when a non-zero-exit delivery child ENDED ITS TURN and produced an answer.
+
+    A turn cut by ``--max-turns`` does not fail — it ends as a RESUMABLE BOUNDARY carrying a
+    summary of the work it completed. The platform's own ``is_max_iteration_handoff``
+    (agent/turn_failure_copy.py:146) defines exactly that, and the JOB lane already delivers such
+    a summary instead of failing the run (cron/scheduler.py:2015, #102213).
+
+    Without this, booking on ``returncode`` alone DROPS a digest that already reached Bot Chat —
+    the very class this lane exists to stop, just relabelled from "timed out" to "exit code 1".
+    Measured on this host: ``--max-turns 1`` posted a 1624-char "1/40, cut off" digest into the
+    chat and reported ``exit_code=1`` with an EMPTY error.
+
+    THE EVIDENCE IS THE CHILD'S OWN PID-CHECKED TURN REPORT — not stderr.
+
+    An earlier cut of this rule also required ``result.stderr`` to be empty, which is
+    unreachable on the path that matters. ``run_reported_turn`` returns two ways, and a
+    delivery child with nothing pending exits at once, so the ``:135`` return (the child's REAL
+    streams) is the common one — and ``-Q`` unconditionally writes to stderr: the
+    ``session_id:`` line (cli_single_query.py:284) and the ``↻ Resumed session`` banner
+    (cli_agent_setup_mixin.py:607). Empty stderr holds only on the rare lingering return
+    (``quiet_single_query.py:154``), where the streams ARE the report's own fields. So the rule
+    fired almost never, and a capped-but-answered turn was booked ``delivery_failed`` with its
+    digest already in the chat — the failure this rule exists to prevent, relabelled from
+    "timed out after 1800s" to "exit code 1".
+
+    ``read_turn_report`` is the authoritative, attributable read: the child writes the record
+    itself (``write_turn_report``) the moment the turn ends, and the reader accepts only a record
+    carrying THIS spawner's nonce (``TURN_REPORT_NONCE_ENV``), so a stale or foreign record can
+    never authorize a forgiveness. ``ReportedTurn`` carries that nonce on BOTH returns precisely
+    so this decision is identical regardless of which one booked the child.
+
+    The nonce, not the pid: on Windows the launcher RE-SPAWNS the CLI
+    (``hermes_bootstrap`` -> ``subprocess.call``), so the record's writer is a grandchild and its
+    pid never equals the launched one. Measured here on a real cap-cut child: the lane saw
+    ``child_pid=34716`` while the report carried ``pid=48108`` — a pid check matches NOTHING on
+    this platform, and a gate that can never fire is the same false negative as no gate at all.
+
+    Positive only: the report must exist, carry no ``error``, and carry a non-empty ``reply``.
+    Everything else — no answer, a provider error, an absent/corrupt/foreign report, or a child
+    that ended without reporting its turn — falls through to the failure path and blotters.
+    """
+    if getattr(result, "returncode", 0) == 0:
+        return False
+    report_file = report_file or getattr(result, "report_file", None)
+    nonce = getattr(result, "report_nonce", None)
+    if not report_file or not nonce:
+        return False
+    from hermes_cli.quiet_single_query import read_turn_report
+
+    record = read_turn_report(report_file, nonce=nonce)
+    if not record:
+        return False
+    if str(record.get("error") or "").strip():
+        return False
+    return bool(str(record.get("reply") or "").strip())
 
 
 def _run_bot_chat_turn(argv: list, env: dict, report_path: str, timeout: float) -> subprocess.CompletedProcess:
@@ -760,9 +856,7 @@ def _format_failure_streams(result) -> str:
     if err:
         parts.append(f"stderr: {err[-_BOT_CHAT_STDERR_TAIL:]}")
     if out:
-        kept = "\n".join(
-            line for line in out.splitlines()
-            if line.strip() and not line.strip().lstrip("↻ ").startswith(_BOT_CHAT_BANNER_PREFIXES))
+        kept = _bot_chat_answer_text(out)
         parts.append(
             f"stdout: {kept[-_BOT_CHAT_STDOUT_TAIL:]}" if kept
             else "stdout was only the resume banner")
@@ -927,8 +1021,31 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
         report_file = f"{query_file}.turn.json"
         env[TURN_REPORT_FILE_ENV] = report_file
         timeout_s = _get_bot_chat_delivery_timeout()
+        # Bound the delivery child (t_4260d321). It is a full agent turn that the injected
+        # message tells to ACT, so without a bound of its own it works until the wall-clock
+        # cap kills it -- and a killed turn loses the digest it was sent to post. Exhausting
+        # --max-turns asks the model for a summary and ENDS the turn, so a runaway reports
+        # instead of dying. The run budget is derived from the same cap so the child's own
+        # last call cannot hang to the kill either; it stays strictly inside it (the outer
+        # cap needs room to book the report), and the 0.6 factor leaves the wrap-up notice
+        # -- fired at 80% of the budget -- with iterations left to act on it.
+        max_turns = _get_bot_chat_delivery_max_turns()
+        if max_turns:
+            argv += ["--max-turns", str(max_turns)]
+        run_budget_s = max(60, int(timeout_s * 0.6))
+        argv += ["--run-budget", str(run_budget_s)]
         result = _run_bot_chat_turn(argv, env, report_file, timeout_s)
         if result.returncode != 0:
+            # A bounded turn that ENDED and answered is a resumable boundary, not a failed
+            # delivery: the digest is already in Bot Chat, and booking it as a failure would
+            # drop the very result this lane exists to deliver (and blotter the job). Only a
+            # child that produced NO answer is a failure. See _bot_chat_turn_reported_a_digest.
+            if _bot_chat_turn_reported_a_digest(result, report_file):
+                logger.info(
+                    "Job '%s': bot-chat delivery to profile '%s' ended at its turn bound "
+                    "(exit code %s) and posted a summary; booking it delivered",
+                    job_id, profile_label, result.returncode)
+                return None
             tail = _format_failure_streams(result)
             logger.warning(
                 "Job '%s': bot-chat delivery to profile '%s' failed at %s: %s",

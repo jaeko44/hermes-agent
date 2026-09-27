@@ -18,6 +18,8 @@ import json
 from pathlib import Path
 from typing import Optional
 
+from pm._subprocess_windows import hidden_spawn_kwargs
+
 FEATURES_FILENAME = "enabled-features.json"
 
 
@@ -129,6 +131,7 @@ print(json.dumps(result))
              str(venv_dir.resolve()), json.dumps(anchors)],
             cwd=repo_dir, capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=60, check=True,
+            **hidden_spawn_kwargs(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         detail = (getattr(exc, "stderr", None) or str(exc)).strip()

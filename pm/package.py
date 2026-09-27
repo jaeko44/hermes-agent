@@ -8,6 +8,8 @@ import subprocess
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Optional
 
+from pm._subprocess_windows import hidden_spawn_kwargs
+
 if TYPE_CHECKING:
     from pm.store import Store
 
@@ -349,4 +351,6 @@ class Runner:
 
     def run(self, cmd, **kwargs) -> subprocess.CompletedProcess:
         kwargs.setdefault("env", self.env)
+        for key, value in hidden_spawn_kwargs().items():
+            kwargs.setdefault(key, value)
         return subprocess.run(cmd, **kwargs)
