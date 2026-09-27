@@ -15,6 +15,7 @@ import sys
 from typing import Callable
 import uuid
 
+from pm._subprocess_windows import hidden_spawn_kwargs
 from pm.package import InstallError
 
 
@@ -97,6 +98,7 @@ def _validate(python: Path, env: dict[str, str]) -> str:
             [str(python), "-I", "-B", "-c",
              "import packaging, tomli_w, truststore; from ruamel.yaml import YAML"],
             env=env, capture_output=True, text=True, timeout=30,
+            **hidden_spawn_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return str(exc)

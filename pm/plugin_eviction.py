@@ -25,6 +25,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from pm._subprocess_windows import hidden_spawn_kwargs
 from pm.environment import BuildFailure, ResolutionConflict
 from pm.environments import install_state_dir, runtime_facts_path
 from pm.filesystem import durable_write_bytes, file_digest, read_bytes_or_none
@@ -41,7 +42,8 @@ def _interpreter_version() -> str:
     if tools is None:
         raise InstallError("venv", "PM's pinned toolchain is unavailable")
     probe = subprocess.run([str(tools[1]), "-I", "-c", "import platform; print(platform.python_version())"],
-                           capture_output=True, text=True, check=True, timeout=60)
+                           capture_output=True, text=True, check=True, timeout=60,
+                           **hidden_spawn_kwargs())
     return probe.stdout.strip()
 
 

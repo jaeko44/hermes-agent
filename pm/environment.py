@@ -19,6 +19,8 @@ import tempfile
 import time
 from typing import TextIO
 
+from pm._subprocess_windows import hidden_spawn_kwargs
+
 from pm.package import InstallError
 from pm.progress import LiveTail, TextSink, verbose_output
 
@@ -143,7 +145,8 @@ def _run_streaming(command: list[str], *, cwd: Path, env: dict[str, str],
     """Keep CI progress live, a bounded diagnostic tail, and a wall-clock timeout."""
     deadline = time.monotonic() + timeout
     proc = subprocess.Popen(command, cwd=str(cwd), env=env, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=0)
+                            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=0,
+                            **hidden_spawn_kwargs())
     pipe = proc.stdout
     assert isinstance(pipe, io.TextIOWrapper)  # Popen was given stdout=PIPE and text=True.
     tail = ""
@@ -303,7 +306,8 @@ class PythonEnvironment:
                     tail.close(result.returncode == 0)
                     return result
                 return subprocess.run(command, cwd=str(cwd), env=env, capture_output=True,
-                                      text=True, encoding="utf-8", errors="replace", timeout=timeout)
+                                      text=True, encoding="utf-8", errors="replace", timeout=timeout,
+                                      **hidden_spawn_kwargs())
             except subprocess.TimeoutExpired as exc:
                 from pm.index_config import TIMEOUT_HINT
 
