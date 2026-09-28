@@ -96,7 +96,7 @@ def test_late_turn_report_books_delivery(tmp_path, monkeypatch):
     monkeypatch.setattr(delivery.subprocess, "Popen", _FakeProc)
     late_state = {}
 
-    def fake_read(path, pid):
+    def fake_read(path, pid=None, *, nonce=None):
         # Only after the kill: simulate the report landing in the kill window.
         if pid == 4242 and late_state.get("killed"):
             return {"pid": pid, "exit_code": 0, "error": None}

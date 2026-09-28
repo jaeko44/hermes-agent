@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from typing import Any, Callable, MutableMapping
 
 # Nested A→B→C is one extra turn; this caps a runaway message_agent chain.
@@ -47,6 +48,18 @@ def exit_single_query(code: int) -> None:
 # contract as HERMES_TURN_AUTHOR): nothing the turn spawns inherits it, and a nested one-shot
 # never writes over its host's report — the record also carries the writer's pid.
 TURN_REPORT_FILE_ENV = "HERMES_QUIET_TURN_REPORT_FILE"
+# The nonce that ties a report to the spawner that asked for it. The report is a plain file at a
+# path the spawner chose, so the spawner can already tell its own report from a foreign one; the
+# nonce makes that check survive a PATH that no longer holds only this spawner's file (a shared
+# temp dir, a crash that left a record behind, a re-pointed report_path).
+#
+# It is also the ONLY attribution that works for the writer's identity. The record's ``pid`` is
+# the pid of the process that WROTE it, but on Windows the launcher RE-SPAWNS the real CLI
+# (``hermes_bootstrap`` -> ``subprocess.call``, not ``execv``), so the writer is a grandchild of
+# the process the spawner started and its pid never equals ``proc.pid``. A spawner that checked
+# ``record["pid"] == proc.pid`` therefore matched NOTHING on this platform: measured on a real
+# cap-cut delivery child, the lane saw child_pid=34716 while the report carried pid=48108.
+TURN_REPORT_NONCE_ENV = "HERMES_QUIET_TURN_REPORT_NONCE"
 
 
 def take_turn_report_path(environ: MutableMapping[str, str] = os.environ) -> str | None:
@@ -54,28 +67,62 @@ def take_turn_report_path(environ: MutableMapping[str, str] = os.environ) -> str
     return environ.pop(TURN_REPORT_FILE_ENV, None) or None
 
 
-def write_turn_report(path: str | None, *, exit_code: int, error: str = "", reply: str = "") -> None:
-    """Atomically record ``{pid, exit_code, error, reply}`` at *path*; a no-op without a path. Never
-    raises: the report is the spawner's convenience, the turn itself is already persisted. ``reply``
-    is what the run will print — a spawner booking a lingering child from its report relays it."""
+def take_turn_report_nonce(environ: MutableMapping[str, str] = os.environ) -> str | None:
+    """Read and remove the spawner's turn-report nonce (same contract as the path)."""
+    return environ.pop(TURN_REPORT_NONCE_ENV, None) or None
+
+
+def write_turn_report(path: str | None, *, exit_code: int, error: str = "", reply: str = "",
+                      nonce: str = "") -> None:
+    """Atomically record ``{pid, exit_code, error, reply, nonce}`` at *path*; a no-op without a path.
+    Never raises: the report is the spawner's convenience, the turn itself is already persisted.
+    ``reply`` is what the run will print — a spawner booking a lingering child from its report
+    relays it.
+
+    ``nonce`` is the spawner's own token, so the spawner accepts only a record it asked for
+    (see :data:`TURN_REPORT_NONCE_ENV` for why the pid cannot do this alone). It is read from the
+    environment when not passed, so a child that simply writes its report still echoes the token
+    it was handed — attribution must not depend on every caller remembering to thread it
+    through, and a report written without it is unreadable to a nonce-checking spawner.
+    """
     if not path:
         return
     from utils import atomic_json_write
 
-    record = {"pid": os.getpid(), "exit_code": int(exit_code), "error": str(error or ""), "reply": str(reply or "")}
+    record = {"pid": os.getpid(), "exit_code": int(exit_code), "error": str(error or ""),
+              "reply": str(reply or ""),
+              "nonce": str(nonce or os.environ.get(TURN_REPORT_NONCE_ENV, "") or "")}
     # 0600 from creation: the record now carries the turn's answer, like the 0600 query file beside it.
     with contextlib.suppress(Exception):
         atomic_json_write(path, record, indent=None, mode=0o600)
 
 
-def read_turn_report(path: str, pid: int) -> dict | None:
-    """The child's turn report, or None while absent, unreadable, or written by another process."""
+def read_turn_report(path: str, pid: int | None = None, *, nonce: str | None = None) -> dict | None:
+    """The child's turn report, or None while absent, unreadable, or not attributable to this run.
+
+    Attributable means the record is provably this run's: it carries the spawner's own
+    ``nonce``, or — for a child that predates the nonce and writes none — it was written by the
+    process the spawner started (``pid``). The nonce is the check that actually holds on
+    Windows, where the launcher re-spawns the CLI and the writer is a grandchild whose pid
+    never equals the launched one (see :data:`TURN_REPORT_NONCE_ENV`); the pid fallback keeps a
+    nonce-unaware child readable, and is exactly the check that shipped before, so it can
+    never be WEAKER than the prior behaviour.
+
+    A record matching neither is refused: a stale or foreign report must never authorize a
+    delivery booking.
+    """
     try:
         with open(path, encoding="utf-8-sig") as fh:
             record = json.load(fh)
     except (OSError, ValueError):
         return None
-    if not isinstance(record, dict) or record.get("pid") != pid:
+    if not isinstance(record, dict):
+        return None
+    if nonce and record.get("nonce"):
+        # A child that echoes the nonce is attributable ONLY by it: the pid may belong to a
+        # grandchild, so accepting on pid alone would re-open the foreign-record hole.
+        return record if record.get("nonce") == nonce else None
+    if pid is None or record.get("pid") != pid:
         return None
     return record
 
@@ -84,6 +131,23 @@ def read_turn_report(path: str, pid: int) -> dict | None:
 # that needs only the outcome gives it that long so its real exit code and stream tails are
 # booked instead of the report's summary.
 REPORTED_TURN_EXIT_GRACE_SECONDS = 2.0
+
+
+class ReportedTurn(subprocess.CompletedProcess):
+    """A booked child outcome that also carries its TURN-REPORT ATTRIBUTION.
+
+    ``subprocess.CompletedProcess`` carries neither the launched pid nor anything tying a turn
+    report to this run, so a spawner holding one could not ask ``read_turn_report`` whether the
+    record on disk is one it asked for. That check is what keeps a stale or foreign record from
+    authorizing a delivery booking, so the attribution travels with the outcome rather than
+    being re-derived (and mistaking a grandchild's pid for its own — see
+    :data:`TURN_REPORT_NONCE_ENV`).
+    """
+
+    def __init__(self, args, returncode, stdout, stderr, *, child_pid: int, report_nonce: str = ""):
+        super().__init__(args, returncode, stdout, stderr)
+        self.child_pid = child_pid
+        self.report_nonce = report_nonce
 
 
 def run_reported_turn(argv: list, *, env: MutableMapping[str, str], report_path: str, timeout: float,
@@ -116,9 +180,23 @@ def run_reported_turn(argv: list, *, env: MutableMapping[str, str], report_path:
 
     if encoding is None and sys.platform == "win32":
         encoding = "utf-8"
+
+    def _booked(returncode: int, stdout: str, stderr: str) -> "ReportedTurn":
+        """The outcome a spawner books, carrying this run's report ATTRIBUTION.
+
+        The spawner must be able to prove the turn report on disk is the one it asked for before
+        it may act on that report (booking a delivery, relaying a reply). Carried on BOTH returns
+        so a spawner's decision does not silently change meaning depending on which path booked
+        the child: the nonce always works, and the pid is the fallback for a platform where the
+        launched process IS the writer (see :data:`TURN_REPORT_NONCE_ENV`).
+        """
+        return ReportedTurn(argv, returncode, stdout, stderr, child_pid=proc.pid, report_nonce=nonce)
+
+    nonce = uuid.uuid4().hex
     proc = subprocess.Popen(
         argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        encoding=encoding, errors="replace", env={**env, TURN_REPORT_FILE_ENV: report_path},
+        encoding=encoding, errors="replace",
+        env={**env, TURN_REPORT_FILE_ENV: report_path, TURN_REPORT_NONCE_ENV: nonce},
         cwd=cwd, creationflags=windows_hide_flags())
     streams: dict = {}
 
@@ -132,11 +210,11 @@ def run_reported_turn(argv: list, *, env: MutableMapping[str, str], report_path:
     while True:
         drain.join(timeout=exit_grace if report is not None and exit_grace is not None else 0.25)
         if not drain.is_alive():
-            return subprocess.CompletedProcess(argv, proc.returncode, streams.get("out", ""), streams.get("err", ""))
+            return _booked(proc.returncode, streams.get("out", ""), streams.get("err", ""))
         if report is not None and exit_grace is not None:
             break
         # Re-read while waiting for the cap: a follow-up turn rewrites the report with its answer.
-        report = read_turn_report(report_path, proc.pid) or report
+        report = read_turn_report(report_path, proc.pid, nonce=nonce) or report
         if time.monotonic() >= deadline:
             if report is not None:
                 break
@@ -146,13 +224,12 @@ def run_reported_turn(argv: list, *, env: MutableMapping[str, str], report_path:
             # in the window between the last report check and the kill landing. Re-read once:
             # a report that appeared means the turn completed — book it instead of
             # misreporting a delivered turn as a timeout (and never re-notifying).
-            report = read_turn_report(report_path, proc.pid)
+            report = read_turn_report(report_path, proc.pid, nonce=nonce)
             if report is not None:
                 break
             raise subprocess.TimeoutExpired(argv, timeout)
     # Turn over, child still lingering for a nested reply: not this spawner's wait.
-    return subprocess.CompletedProcess(
-        argv, int(report["exit_code"]), report.get("reply") or "", report.get("error") or "")
+    return _booked(int(report["exit_code"]), report.get("reply") or "", report.get("error") or "")
 
 
 @contextlib.contextmanager
