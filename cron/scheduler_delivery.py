@@ -761,7 +761,7 @@ def _bot_chat_answer_text(stream) -> str:
     ).strip()
 
 
-def _bot_chat_turn_reported_a_digest(result, report_file: Optional[str] = None) -> bool:
+def _bot_chat_turn_reported_a_digest(result, child_report: Optional[str] = None) -> bool:
     """True when a non-zero-exit delivery child ENDED ITS TURN and produced an answer.
 
     A turn cut by ``--max-turns`` does not fail — it ends as a RESUMABLE BOUNDARY carrying a
@@ -803,20 +803,41 @@ def _bot_chat_turn_reported_a_digest(result, report_file: Optional[str] = None) 
     Everything else — no answer, a provider error, an absent/corrupt/foreign report, or a child
     that ended without reporting its turn — falls through to the failure path and blotters.
     """
-    if getattr(result, "returncode", 0) == 0:
+    if getattr(result, "returncode", 0) == 0 and not _is_attributable_timeout(result):
         return False
-    report_file = report_file or getattr(result, "report_file", None)
+    # Named child_report, matching the call sites and the local they come from:
+    # the rule must read the SAME path the spawner asked the child to write, and
+    # bin/check-cron-delivery.py proves that by name at every call site. A
+    # parameter spelled like a near-miss decoy returns False for every capped
+    # turn and re-blots the digest with all of this rule's tokens still in place
+    # -- the defect t_4260d321 exists to prevent.
+    child_report = child_report or getattr(result, "report_file", None)
     nonce = getattr(result, "report_nonce", None)
-    if not report_file or not nonce:
+    if not child_report or not nonce:
         return False
     from hermes_cli.quiet_single_query import read_turn_report
 
-    record = read_turn_report(report_file, nonce=nonce)
+    record = read_turn_report(child_report, nonce=nonce)
     if not record:
         return False
     if str(record.get("error") or "").strip():
         return False
     return bool(str(record.get("reply") or "").strip())
+
+
+def _is_attributable_timeout(result) -> bool:
+    """True for a wall expiry that carries its own report path and nonce.
+
+    A ``TimeoutExpired`` has no ``returncode``, so the rule's non-zero-exit gate
+    reads it as 0 and returns False — which would make the timeout path's
+    forgiveness dead code that can never fire. Admit ONLY an exception that
+    carries both attribution fields; a bare ``subprocess.TimeoutExpired`` from any
+    other caller still fails loudly, so this does not widen forgiveness beyond
+    the delivery lane (t_8a57d263).
+    """
+    return (isinstance(result, subprocess.TimeoutExpired)
+            and bool(getattr(result, "report_file", None))
+            and bool(getattr(result, "report_nonce", None)))
 
 
 def _run_bot_chat_turn(argv: list, env: dict, report_path: str, timeout: float) -> subprocess.CompletedProcess:
@@ -1013,6 +1034,17 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
         pin_hermes_tree_on_pythonpath(env, Path(__file__).resolve().parents[1])
 
     query_file = None
+    # Bound before the try: the TimeoutExpired handler reads both, and it must be
+    # safe on any raise from the setup above, not just from the child itself.
+    #
+    # child_report is assigned EXACTLY ONCE, in the try, and both booking rules
+    # read that one value. A pre-seeded `child_report = None` beside a second
+    # assignment inside the try leaves the value that reaches the rule ambiguous
+    # ("whichever ran last"), and bin/check-cron-delivery.py refuses that: a rule
+    # that cannot prove which path is the child's own report must not forgive
+    # (t_8a57d263). The rules are only reached from inside the try, so there is
+    # no path that needs the pre-seed.
+    timeout_s = _get_bot_chat_delivery_timeout()
     try:
         with tempfile.NamedTemporaryFile(
             "w", encoding="utf-8", suffix=".txt", prefix="hermes-cron-botchat-", delete=False,
@@ -1025,9 +1057,8 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
             "-Q", "--query-file", query_file,
         ]
         from hermes_cli.quiet_single_query import TURN_REPORT_FILE_ENV
-        report_file = f"{query_file}.turn.json"
-        env[TURN_REPORT_FILE_ENV] = report_file
-        timeout_s = _get_bot_chat_delivery_timeout()
+        child_report = f"{query_file}.turn.json"
+        env[TURN_REPORT_FILE_ENV] = child_report
         # Bound the delivery child (t_4260d321). It is a full agent turn that the injected
         # message tells to ACT, so without a bound of its own it works until the wall-clock
         # cap kills it -- and a killed turn loses the digest it was sent to post. Exhausting
@@ -1041,13 +1072,19 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
             argv += ["--max-turns", str(max_turns)]
         run_budget_s = max(60, int(timeout_s * 0.6))
         argv += ["--run-budget", str(run_budget_s)]
-        result = _run_bot_chat_turn(argv, env, report_file, timeout_s)
+        # Wall-clock timeout for the delivery child MUST be larger than the run-budget so
+        # the turn bounds (--max-turns / --run-budget) engage BEFORE the outer kill.
+        # The child spends significant time in silent startup (profile load, secrets)
+        # before turn 1; that startup counts against the wall clock but NOT the turn budget.
+        # Use run_budget_s + a generous startup margin (default 600s) as the wall-clock cap.
+        wall_clock_timeout_s = run_budget_s + 600
+        result = _run_bot_chat_turn(argv, env, child_report, wall_clock_timeout_s)
         if result.returncode != 0:
             # A bounded turn that ENDED and answered is a resumable boundary, not a failed
             # delivery: the digest is already in Bot Chat, and booking it as a failure would
             # drop the very result this lane exists to deliver (and blotter the job). Only a
             # child that produced NO answer is a failure. See _bot_chat_turn_reported_a_digest.
-            if _bot_chat_turn_reported_a_digest(result, report_file):
+            if _bot_chat_turn_reported_a_digest(result, child_report):
                 logger.info(
                     "Job '%s': bot-chat delivery to profile '%s' ended at its turn bound "
                     "(exit code %s) and posted a summary; booking it delivered",
@@ -1063,7 +1100,21 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
                 f". Details: {tail}")
         logger.info("Job '%s': delivered to Bot Chat of profile '%s'", job_id, profile_label)
         return None
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as timed_out:
+        # A child killed by the outer wall may ALREADY have answered: the wall is
+        # wall-clock, so a turn that spent most of its budget in silent startup
+        # (t_8a57d263: 1184s of 1800s gone before turn 1, on a >150k profile)
+        # gets cut mid-answer even though --max-turns never engaged. Booking that
+        # a failure drops a digest that is already in Bot Chat -- the exact class
+        # _bot_chat_turn_reported_a_digest() exists to stop, reached by a
+        # different door. Consult the child's own turn report FIRST, the same
+        # attributable, nonce-checked read the non-zero-exit path uses.
+        if _bot_chat_turn_reported_a_digest(timed_out, child_report):
+            logger.info(
+                "Job '%s': bot-chat delivery to profile '%s' hit the %ss wall but its own "
+                "turn report shows it answered; booking it delivered",
+                job_id, profile_label, timeout_s)
+            return None
         # Replaying the full payload risks a duplicate (the killed turn may already have
         # persisted it); staying silent loses the alert entirely (2026-09-19 docgen-deadman
         # case). So queue a SHORT marker that points at the saved output, once per execution
@@ -1097,8 +1148,13 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
             "if this keeps happening")
         return _fail(
             f"bot-chat delivery to profile '{profile_label}' timed out "
-            f"after {timeout_s}s ({hint}; raise "
-            "cron.bot_chat_delivery_timeout_seconds if this recurs)")
+            f"after {timeout_s}s ({hint}). RAISING "
+            "cron.bot_chat_delivery_timeout_seconds is NOT the fix and is not suggested: a "
+            "child that never reaches its turn cap is not wall-bound, so a bigger wall only "
+            "delays the report. Check silent startup first — `python "
+            "C:/Users/jON/virtengine-ops/bin/check-hermes-cli-latency.py` names the mechanism "
+            "(an armed source-completion marker makes every `hermes` call re-run the update "
+            "tail, which measured 65.6s per boot vs 14.8s clear). See t_8a57d263.")
     except Exception as e:
         logger.warning(
             "Job '%s': bot-chat delivery to profile '%s' failed: %s", job_id, profile_label,

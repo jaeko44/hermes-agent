@@ -77,7 +77,11 @@ def _parse_workspace_flag(value: Optional[str]) -> tuple[Optional[str], Optional
         path = v[len(prefix):].strip()
         if not path:
             raise argparse.ArgumentTypeError(f"--workspace {prefix} requires a path after the colon")
-        return (kind, os.path.expanduser(path))
+        # PREVENTION: resolve relative paths to absolute at creation time
+        # (dispatch-time validation in kbw.resolve_worktree_path rejects non-absolute)
+        path = os.path.expanduser(path)
+        path = os.path.abspath(path)
+        return (kind, path)
     raise argparse.ArgumentTypeError(f"unknown --workspace value {value!r}: use scratch, worktree, "
                                      "worktree:<path>, or dir:<path>")
 

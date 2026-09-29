@@ -150,6 +150,29 @@ class ReportedTurn(subprocess.CompletedProcess):
         self.report_nonce = report_nonce
 
 
+class ReportedTurnTimeout(subprocess.TimeoutExpired):
+    """A wall that expired with this run's ATTRIBUTION attached.
+
+    A plain ``subprocess.TimeoutExpired`` carries no way to tell whose turn it was,
+    so a spawner that forgives on the strength of a turn report has nothing
+    provable to check and must treat every timeout as a failure. On this estate
+    that booked a delivery whose digest was already in Bot Chat as ``timed_out``
+    (t_8a57d263): the wall is wall-clock, so a child that spent its budget in
+    silent startup gets cut mid-answer with ``--max-turns`` never engaged.
+
+    Subclassing keeps every existing ``except subprocess.TimeoutExpired`` handler
+    working unchanged while carrying the report path and nonce the booking rule
+    needs. The attributes mirror :class:`ReportedTurn` deliberately, so one rule
+    can read either outcome.
+    """
+
+    def __init__(self, args, timeout, *, report_path: str, report_nonce: str, child_pid: int):
+        super().__init__(args, timeout)
+        self.report_file = report_path
+        self.report_nonce = report_nonce
+        self.child_pid = child_pid
+
+
 def run_reported_turn(argv: list, *, env: MutableMapping[str, str], report_path: str, timeout: float,
                       exit_grace: float | None = REPORTED_TURN_EXIT_GRACE_SECONDS, cwd: str | None = None,
                       encoding: str | None = None) -> subprocess.CompletedProcess:
@@ -227,7 +250,17 @@ def run_reported_turn(argv: list, *, env: MutableMapping[str, str], report_path:
             report = read_turn_report(report_path, proc.pid, nonce=nonce)
             if report is not None:
                 break
-            raise subprocess.TimeoutExpired(argv, timeout)
+            # The wall expired with NO report: this child produced no answer. Attach
+            # this run's nonce to the exception anyway, so a spawner that forgives on
+            # the strength of a turn report has an ATTRIBUTABLE path to check rather
+            # than guessing (a bare TimeoutExpired proves nothing -- t_8a57d263).
+            # read_turn_report() is nonce-checked, so a stale or foreign report on
+            # this path still cannot authorize anything. A real subclass, not
+            # setattr() on a stdlib exception: this stays an except-compatible
+            # TimeoutExpired for every existing handler while carrying the
+            # attribution the booking rule needs.
+            raise ReportedTurnTimeout(argv, timeout, report_path=report_path,
+                                      report_nonce=nonce, child_pid=proc.pid)
     # Turn over, child still lingering for a nested reply: not this spawner's wait.
     return _booked(int(report["exit_code"]), report.get("reply") or "", report.get("error") or "")
 

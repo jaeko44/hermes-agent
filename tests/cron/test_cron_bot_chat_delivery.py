@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from unittest import mock
@@ -199,6 +200,94 @@ def test_deliver_timeout_returns_error_string():
         err = _deliver_to_bot_chat({"id": "j1", "name": "n"}, "out", "")
     assert err is not None
     assert "timed out" in err
+
+
+def test_deliver_timeout_does_not_advise_raising_the_timeout():
+    """"Raise cron.bot_chat_delivery_timeout_seconds" was the WRONG remedy and
+    was repeated verbatim in every failure across the estate. A child that never
+    reaches --max-turns (t_8a57d263: 1184s of 1800s gone to silent startup, 21
+    of 40 turns used) is not wall-bound, so a bigger wall only delays the
+    report. The advice must not come back."""
+    with mock.patch.object(
+        sched_delivery, "_run_bot_chat_turn",
+        side_effect=subprocess.TimeoutExpired(cmd="hermes", timeout=600),
+    ), mock.patch.object(sched_delivery.shutil, "which", return_value="/usr/bin/hermes"):
+        err = _deliver_to_bot_chat({"id": "j1", "name": "n"}, "out", "")
+    assert err is not None
+    assert "raise cron.bot_chat_delivery_timeout_seconds" not in err
+    assert "check-hermes-cli-latency.py" in err
+
+
+def test_deliver_timeout_books_delivered_when_the_child_already_answered():
+    """The wall is wall-clock, so a child that burned its budget in silent
+    startup is cut mid-answer with --max-turns never engaged. Its digest is
+    already in Bot Chat; booking that a failure drops the result this lane
+    exists to deliver. The TimeoutExpired path must consult the child's own
+    turn report exactly as the non-zero-exit path does (t_8a57d263)."""
+    exc = subprocess.TimeoutExpired(cmd="hermes", timeout=600)
+    with mock.patch.object(
+        sched_delivery, "_run_bot_chat_turn", side_effect=exc,
+    ), mock.patch.object(
+        sched_delivery, "_bot_chat_turn_reported_a_digest", return_value=True,
+    ) as reported, mock.patch.object(
+        sched_delivery.shutil, "which", return_value="/usr/bin/hermes",
+    ):
+        err = _deliver_to_bot_chat({"id": "j1", "name": "n"}, "out", "")
+    assert err is None, "an answered child must not be booked a delivery failure"
+    reported.assert_called_once()
+
+
+def test_deliver_timeout_still_fails_when_the_child_never_answered():
+    """The new forgiveness is positive-only: a child with no turn report (or an
+    empty reply) is still a failure and still gets the degraded marker."""
+    with mock.patch.object(
+        sched_delivery, "_run_bot_chat_turn",
+        side_effect=subprocess.TimeoutExpired(cmd="hermes", timeout=600),
+    ), mock.patch.object(
+        sched_delivery, "_bot_chat_turn_reported_a_digest", return_value=False,
+    ), mock.patch.object(sched_delivery.shutil, "which", return_value="/usr/bin/hermes"):
+        err = _deliver_to_bot_chat({"id": "j1", "name": "n"}, "out", "")
+    assert err is not None
+    assert "timed out" in err
+
+
+def test_reported_turn_timeout_is_a_real_timeout_and_carries_attribution():
+    """The wall must stay except-compatible for every other handler, and it must
+    carry the report path + nonce the booking rule reads -- without them the
+    delivery lane's forgiveness is DEAD CODE that can never fire."""
+    from hermes_cli.quiet_single_query import ReportedTurnTimeout
+
+    exc = ReportedTurnTimeout(["hermes"], 600, report_path="/tmp/r.json",
+                              report_nonce="abc123", child_pid=4242)
+    assert isinstance(exc, subprocess.TimeoutExpired), "existing handlers must still catch it"
+    assert exc.report_file == "/tmp/r.json"
+    assert exc.report_nonce == "abc123"
+    assert exc.child_pid == 4242
+
+
+def test_rule_reads_a_real_nonce_checked_turn_report_after_a_wall():
+    """End-to-end: the timeout path forgives ONLY on a report that carries this
+    run's nonce. A foreign/stale report on the same path must NOT forgive, or the
+    new rule would book a delivery from someone else's turn."""
+    from hermes_cli.quiet_single_query import ReportedTurnTimeout, write_turn_report
+
+    with tempfile.TemporaryDirectory() as td:
+        report = os.path.join(td, "turn.json")
+        write_turn_report(report, exit_code=0, reply="the digest already reached Bot Chat",
+                          error="", nonce="mine")
+
+        mine = ReportedTurnTimeout(["hermes"], 600, report_path=report,
+                                   report_nonce="mine", child_pid=1)
+        assert sched_delivery._bot_chat_turn_reported_a_digest(mine) is True
+
+        # Same file, someone else's nonce: must not authorize a booking.
+        theirs = ReportedTurnTimeout(["hermes"], 600, report_path=report,
+                                     report_nonce="not-mine", child_pid=1)
+        assert sched_delivery._bot_chat_turn_reported_a_digest(theirs) is False
+
+        # A bare TimeoutExpired (any other caller) proves nothing and must not.
+        bare = subprocess.TimeoutExpired(["hermes"], 600)
+        assert sched_delivery._bot_chat_turn_reported_a_digest(bare) is False
 
 
 def test_deliver_message_carries_cron_attribution(tmp_path):
