@@ -132,6 +132,13 @@ def _read_terminal_receipt(request: dict) -> dict | None:
     return None
 
 
+def _arm_completion_for_update(root: Path) -> Path:
+    """Reuse an outstanding obligation; the update tail itself discharges it on success."""
+    from hermes_cli.venv_sync import arm_completion
+
+    return arm_completion(root, origin="update_completion._prepare")
+
+
 def _prepare(request: dict, request_path: Path, result_path: Path) -> int:
     import pm
     from pm import receipt
@@ -141,14 +148,14 @@ def _prepare(request: dict, request_path: Path, result_path: Path) -> int:
     root = Path(request["source"])
     update_id = request["receipt"]["update_id"]
     from hermes_cli.venv_sync import (
-        arm_completion, collect_superseded_generations, refuse_foreign_owned_venv,
+        collect_superseded_generations, refuse_foreign_owned_venv,
     )
 
     refuse_foreign_owned_venv(root)
-    # fresh=True: an update starts a NEW obligation. The launch path (venv_sync) must never
-    # re-mint one, or a launch that finds a failed tail outstanding would re-open it forever
-    # (t_f6924d31); here the update really does owe the tail it is about to run.
-    arm_completion(root, fresh=True)
+    # The updater's tail fulfills any existing obligation too. Preserve its generation and
+    # spent-attempt record across retries; otherwise every interrupted `hermes update` would
+    # mint a fresh identity and reset the launch path's one-attempt budget.
+    _arm_completion_for_update(root)
     with receipt.worker_context(update_id):
         try:
             # This file runs from the new tree, so its lockfile carries the new

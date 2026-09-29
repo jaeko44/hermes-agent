@@ -96,6 +96,19 @@ def test_failed_completion_tail_is_not_retried_on_every_launch(tmp_path, monkeyp
         venv_sync.prepare_launch(root, [])
     assert len(syncs) == 1 and len(completion_tail) == 1
     assert pm.venv_is_current()
+    pending = venv_sync.completion_pending_path(root)
+    generation = venv_sync._pending_generation(pending)
+    assert generation
+    assert "origin: venv_sync._finish_source_update (current=False)" in pending.read_text()
+
+    # A retry update's prepare phase must preserve a spent obligation instead of rearming it
+    # with a fresh identity. The updater's own completion tail is the recovery owner.
+    attempt_before = venv_sync.completion_attempt_path(root).read_text()
+    from hermes_cli import update_completion
+    assert update_completion._arm_completion_for_update(root) == pending
+    assert venv_sync._pending_generation(pending) == generation
+    assert venv_sync.completion_attempt_path(root).read_text() == attempt_before
+    assert venv_sync.tail_already_attempted(root, pending)
 
     # The second launch does NOT raise: this obligation has spent its one attempt, so the
     # launch path prints the remedy and RETURNS (venv_sync.py:412-421). The dependency

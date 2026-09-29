@@ -193,21 +193,27 @@ def _pending_generation(pending: Path) -> str:
     return ""
 
 
-def arm_completion(project_root: Path, *, fresh: bool = False) -> Path:
+def arm_completion(project_root: Path, *, fresh: bool = False, origin: str | None = None) -> Path:
     """Persist the tail obligation before selecting a new dependency generation.
 
     IDEMPOTENT unless *fresh*: an obligation that is already outstanding keeps its marker,
     its identity and its attempt record. ``_sync_source_dependencies`` arms on every launch
     that finds the dependencies stale, so an unconditional re-arm minted a NEW obligation each
     time and deleted the record that said this install had already run the tail — every launch
-    then paid the whole tail again (t_f6924d31). ``fresh=True`` is for a new update
-    (``update_completion``), which owes a tail of its own regardless of earlier attempts.
+    then paid the whole tail again (t_f6924d31). Update preparation is also idempotent: its own
+    completion tail supersedes any earlier owed tail, so a retry must not mint a new generation
+    and reset the one-attempt recovery budget. ``fresh=True`` is reserved for a genuinely new
+    obligation when the caller explicitly needs to supersede an existing one.
+
+    ``origin`` is a stable code-path label, never user input; it persists the arm site so a
+    future stale marker names its generator without exposing a process command line.
     """
     pending = completion_pending_path(project_root)
     if pending.is_file() and not fresh:
         return pending
     pending.parent.mkdir(parents=True, exist_ok=True)
-    pending.write_text(f"source update tail not finished\n{_OBLIGATION_LINE}{_new_generation()}\n",
+    provenance = f"origin: {origin}\n" if origin else ""
+    pending.write_text(f"source update tail not finished\n{_OBLIGATION_LINE}{_new_generation()}\n{provenance}",
                        encoding="utf-8")
     # A new obligation supersedes any earlier attempt: it is owed a tail of its own.
     _drop_completion_attempt(project_root)
@@ -408,7 +414,7 @@ def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
         # idempotent, so the identity the attempt record is keyed on is the one this
         # obligation already has. A fresh one is minted only for a genuinely new obligation
         # (no marker at all) — that is what makes the crash-recovery path still work.
-        pending = arm_completion(root)
+        pending = arm_completion(root, origin="venv_sync._finish_source_update (current=False)")
     if tail_already_attempted(root, pending):
         # The tail is not a thing to re-run on every launch until it works: it costs minutes
         # (Node deps + TUI + web + desktop) and, when the dependencies are stale, a sync that
@@ -488,7 +494,7 @@ def _sync_source_dependencies(root: Path, *, arm: bool) -> None:
     if arm:
         # Owed from before the sync commits: a crash between the commit and the
         # tail must leave the tail, not a "current" install with nothing built.
-        arm_completion(root)
+        arm_completion(root, origin="venv_sync._sync_source_dependencies (arm=True)")
     # Main-era installs have no PM ledger; carry what their venv held.
     # Established PM installs retain their recorded extras and plugin union instead.
     extras = legacy_selection(root) if not runtime_facts_path(root).is_file() else None
