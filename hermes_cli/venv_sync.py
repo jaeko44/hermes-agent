@@ -168,16 +168,120 @@ def completion_pending_path(project_root: Path) -> Path:
     return install_state_dir(project_root) / "source-completion-pending"
 
 
-def arm_completion(project_root: Path) -> Path:
-    """Persist the tail obligation before selecting a new dependency generation."""
+#: Second line of the obligation marker: the identity the tail attempt is keyed on. It is
+#: minted ONCE, by the arm that creates the obligation, so a launch that re-arms the SAME
+#: obligation can never re-open a tail that already ran. The identity used to be the marker's
+#: mtime, which the boot path itself rewrote on every launch (t_f6924d31 D2).
+_OBLIGATION_LINE = "generation: "
+
+
+def _new_generation() -> str:
+    import uuid
+
+    return uuid.uuid4().hex
+
+
+def _pending_generation(pending: Path) -> str:
+    """The generation stamped at arm time; "" for a marker this version did not write."""
+    try:
+        text = pending.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    for line in text.splitlines():
+        if line.strip().startswith(_OBLIGATION_LINE):
+            return line.split(_OBLIGATION_LINE, 1)[1].strip()
+    return ""
+
+
+def arm_completion(project_root: Path, *, fresh: bool = False) -> Path:
+    """Persist the tail obligation before selecting a new dependency generation.
+
+    IDEMPOTENT unless *fresh*: an obligation that is already outstanding keeps its marker,
+    its identity and its attempt record. ``_sync_source_dependencies`` arms on every launch
+    that finds the dependencies stale, so an unconditional re-arm minted a NEW obligation each
+    time and deleted the record that said this install had already run the tail — every launch
+    then paid the whole tail again (t_f6924d31). ``fresh=True`` is for a new update
+    (``update_completion``), which owes a tail of its own regardless of earlier attempts.
+    """
     pending = completion_pending_path(project_root)
+    if pending.is_file() and not fresh:
+        return pending
     pending.parent.mkdir(parents=True, exist_ok=True)
-    pending.write_text("source update tail not finished\n", encoding="utf-8")
+    pending.write_text(f"source update tail not finished\n{_OBLIGATION_LINE}{_new_generation()}\n",
+                       encoding="utf-8")
+    # A new obligation supersedes any earlier attempt: it is owed a tail of its own.
+    _drop_completion_attempt(project_root)
     return pending
 
 
 def clear_completion(project_root: Path) -> None:
     completion_pending_path(project_root).unlink(missing_ok=True)
+    _drop_completion_attempt(project_root)
+
+
+def completion_attempt_path(project_root: Path) -> Path:
+    """Record that the tail has ALREADY been attempted for the current marker.
+
+    The marker alone cannot tell "a crash before the tail ran" from "the tail ran and did
+    not finish": a failing or externally killed tail leaves the marker behind, so every later
+    ``hermes`` invocation re-ran the whole tail. Measured on this host: ~3 minutes per call,
+    unbounded, for every command in every profile (t_f6924d31).
+
+    The record carries the marker mtime it belongs to, so a *fresh* obligation
+    (``arm_completion`` writes a new marker) is still attempted once, and a tail that already
+    ran is left to ``hermes update`` instead of taxing every command forever.
+    """
+    from pm.environments import install_state_dir
+
+    return install_state_dir(project_root) / "source-completion-attempted.json"
+
+
+def _drop_completion_attempt(project_root: Path) -> None:
+    completion_attempt_path(project_root).unlink(missing_ok=True)
+
+
+def _marker_identity(pending: Path) -> str:
+    """The obligation's identity: the generation it was armed with, else its own mtime.
+
+    The generation is what makes this stable: it is written once, by the arm that created the
+    obligation, and nothing on the launch path rewrites it. The mtime fallback covers a marker
+    armed by an older Hermes (or written by hand or a test), which has no generation to key on.
+    """
+    generation = _pending_generation(pending)
+    if generation:
+        return f"generation:{generation}"
+    try:
+        return "mtime:%.6f" % pending.stat().st_mtime
+    except OSError:
+        return "missing"
+
+
+def tail_already_attempted(project_root: Path, pending: Path) -> bool:
+    """True when the tail ran (or was killed) for exactly this pending marker."""
+    try:
+        data = json.loads(completion_attempt_path(project_root).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return data.get("marker") == _marker_identity(pending)
+
+
+def record_completion_attempt(project_root: Path, pending: Path, *, code: int | None) -> None:
+    """Persist the attempt BEFORE the tail runs: a killed tail still gets no second try.
+
+    Not raising here is deliberate — failing to record must never itself break a launch.
+    """
+    import time
+
+    path = completion_attempt_path(project_root)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "marker": _marker_identity(pending),
+            "at": time.time(),
+            "exit_code": code,
+        }, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 def refuse_foreign_owned_venv(project_root: Path) -> None:
@@ -215,10 +319,13 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
     """Finish a self-managed source update before importing app dependencies.
 
     PM's successful input stamp signals a finished dependency sync; the
-    ``source-completion-pending`` marker signals the tail still owed after it,
-    so a tail that failed is retried on the next launch WITHOUT rebuilding
-    dependencies that are already current. Old updaters need not write a
-    marker (and cannot accidentally clear this obligation).
+    ``source-completion-pending`` marker signals the tail still owed after it.
+    Each obligation is attempted AT MOST ONCE: a repair that re-runs itself on
+    every command is worse than the state it repairs (measured here: 73s-192s per
+    ``hermes`` invocation, every command, every profile — t_f6924d31). The
+    obligation survives in the marker for ``hermes update``, which owns it; a
+    genuinely new obligation still gets a tail of its own.
+    Old updaters need not write a marker (and cannot accidentally clear this obligation).
     Return the store interpreter when this process must restart cleanly.
     """
     import os
@@ -297,10 +404,49 @@ def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
         legacy_markers = (root / ".update-incomplete", root / ".lazy-refresh-incomplete")
         if any(_marker_owner_is_live(marker) for marker in legacy_markers):
             raise RuntimeError("an update is still running; wait for it to exit, then relaunch Hermes")
+        # Normalize the obligation BEFORE anything is spent or recorded: arming is
+        # idempotent, so the identity the attempt record is keyed on is the one this
+        # obligation already has. A fresh one is minted only for a genuinely new obligation
+        # (no marker at all) — that is what makes the crash-recovery path still work.
+        pending = arm_completion(root)
+    if tail_already_attempted(root, pending):
+        # The tail is not a thing to re-run on every launch until it works: it costs minutes
+        # (Node deps + TUI + web + desktop) and, when the dependencies are stale, a sync that
+        # blocks behind a live stager's prepare lock. A repair path retried forever on every
+        # command is worse than the state it repairs. The obligation survives in the marker
+        # for `hermes update`; a NEW obligation re-arms an attempt of its own.
+        if not current:
+            # The one attempt is spent AND the sync it owed never committed, so this install
+            # is still not current. Returning here does not end the launch quietly: the
+            # caller reaches `if not current or not same: return python` (below), hands the
+            # launcher a store interpreter, and hermes_bootstrap re-execs
+            # (hermes_bootstrap.py:533-543) into a process that recomputes exactly this
+            # state — so the CLI spawns interpreters until the host gives up. Measured on a
+            # clone whose sync raises "network unavailable": launch 2 and launch 3 each
+            # RETURNED .../Scripts/python.exe while venv_is_current() stayed False
+            # (t_5f5e6615). Raising keeps the documented terminal state instead:
+            # hermes_bootstrap.py:544-551 warns and runs on the previous dependency
+            # generation, which is intact because a failed sync commits nothing.
+            raise RuntimeError(
+                "the dependencies this update still owes are stale and the launch path has "
+                "already spent its one attempt at them; run `hermes update` to finish it"
+            )
+        print("hermes: the source-update tail already ran for this install state and did not "
+              "finish; not retrying it on every launch — run `hermes update` to finish it",
+              file=sys.stderr, flush=True)
+        return
+    if not current:
         print("hermes: completing source-update dependencies...", file=sys.stderr, flush=True)
+        # Recorded BEFORE the sync: the sync is the expensive half (a prepare-lock stage on
+        # this host costs 30s+ per attempt and the products cost minutes), and a launch that
+        # never got past it is still an attempt this install must not repeat forever.
+        record_completion_attempt(root, pending, code=None)
         _sync_source_dependencies(root, arm=True)
     else:
         print("hermes: finishing an interrupted source update...", file=sys.stderr, flush=True)
+        # Recorded BEFORE the child runs: a tail killed by the caller's own timeout is still
+        # an attempt, and must not be re-run on the next launch.
+        record_completion_attempt(root, pending, code=None)
     # Sync commits the dependency generation, but a source update also owes
     # the product builds and the post-build maintenance -- the tail every
     # install and finished update shares (hermes_cli/source_completion.py).
@@ -317,9 +463,10 @@ def _finish_source_update(root: Path, *, current: bool, pending: Path) -> None:
         [sys.executable, "-I", "-B", "-u",
          str(root / "hermes_cli/source_completion.py"),
          "--source", str(root), "--finish-update",
-         *(("--desktop",) if desktop else ())],
+         *((("--desktop", "--desktop-optional") if desktop else ()))],
         cwd=root, env=activation_environment(root), stdout=sys.__stderr__,
     )
+    record_completion_attempt(root, pending, code=code)
     if code != 0:
         raise RuntimeError(
             "source update completion failed; run `hermes update` to finish it"

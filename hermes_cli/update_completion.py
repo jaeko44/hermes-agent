@@ -145,7 +145,10 @@ def _prepare(request: dict, request_path: Path, result_path: Path) -> int:
     )
 
     refuse_foreign_owned_venv(root)
-    arm_completion(root)
+    # fresh=True: an update starts a NEW obligation. The launch path (venv_sync) must never
+    # re-mint one, or a launch that finds a failed tail outstanding would re-open it forever
+    # (t_f6924d31); here the update really does owe the tail it is about to run.
+    arm_completion(root, fresh=True)
     with receipt.worker_context(update_id):
         try:
             # This file runs from the new tree, so its lockfile carries the new

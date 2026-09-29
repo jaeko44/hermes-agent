@@ -36,11 +36,15 @@ def complete_source_checkout(
     pre_update_version: str | None = None,
     completion_message: str | None = None,
     announce: str | None = None,
+    desktop_optional: bool = False,
 ) -> bool:
     """Publish commands, build the products, then run post-build maintenance.
 
     Returns the SQLite runtime verdict: a positive unsafe-runtime probe withholds
     success here exactly as it does at the end of an update.
+
+    ``desktop_optional`` (the launch repair tail) keeps a failed desktop rebuild from
+    failing the whole tail — see ``build_update_products``.
     """
     from hermes_cli.source_build import build_update_products
     from hermes_cli.update_cmd_maint import _run_post_update_maintenance
@@ -56,7 +60,7 @@ def complete_source_checkout(
     except Exception as exc:  # noqa: BLE001 — git-less steps below still complete
         print(f"⚠ Could not provide git for the source completion: {exc}", file=sys.stderr)
     publish_launchers(root)
-    build_update_products(root, desktop=desktop)
+    build_update_products(root, desktop=desktop, desktop_optional=desktop_optional)
     if announce:
         print(announce)
     complete = _run_post_update_maintenance(
@@ -93,6 +97,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--desktop", action="store_true",
                         help="Also build the packaged desktop app.")
+    parser.add_argument("--desktop-optional", action="store_true",
+                        help="A failed desktop rebuild is reported, not fatal. The launch "
+                             "repair tail passes this: a marker that survives a failed "
+                             "desktop build re-arms the whole tail on every CLI start.")
     parser.add_argument("--interactive", action="store_true",
                         help="Allow prompts; installers pass no flag and stay unattended.")
     parser.add_argument("--finish-update", action="store_true",
@@ -119,11 +127,13 @@ def main(argv: list[str] | None = None) -> int:
             ok = complete_source_checkout(
                 root, desktop=args.desktop, assume_yes=True,
                 completion_message=None, announce="\n✓ Code updated!",
+                desktop_optional=args.desktop_optional,
             )
         else:
             ok = complete_source_checkout(
                 root, desktop=args.desktop, assume_yes=not args.interactive,
                 completion_message="✓ Install complete!",
+                desktop_optional=args.desktop_optional,
             )
         return 0 if ok else 1
 
@@ -133,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
     # every flag that decides WHICH tail runs has to survive into it. Losing
     # --finish-update here silently reports an update as an install.
     passthrough = (["--desktop"] if args.desktop else []) + \
+                  (["--desktop-optional"] if args.desktop_optional else []) + \
                   (["--finish-update"] if args.finish_update else [])
     command = _bootstrap_command(root, passthrough)
     return subprocess.call(command, cwd=root, env=activation_environment(root))

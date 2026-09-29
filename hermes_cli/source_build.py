@@ -99,8 +99,30 @@ def source_frontends(project_root: Path) -> tuple[str, ...]:
     return tuple(name for name in ("ui-tui", "web") if (project_root / name / "package.json").is_file())
 
 
-def build_update_products(project_root: Path, *, desktop: bool) -> None:
-    """Prepare the selected union once; a failed product aborts the update."""
+def _build_desktop_product(project_root: Path, *, env: dict) -> None:
+    """Rebuild and re-install the packaged desktop app from this checkout."""
+    from hermes_cli.main_desktop import _refresh_installed_desktop_apps, build_prepared_desktop
+    from hermes_cli.update_stage import publish_stage
+
+    publish_stage("Building the desktop app")
+    build_prepared_desktop(
+        project_root / "apps/desktop", source_mode=False,
+        npm=shutil.which("npm", path=env["PATH"]), env=env, icons=project_root,
+    )
+    # A current release/ can still sit beside a stale installed copy (an earlier
+    # update rebuilt but never installed); healing must not wait for the next build.
+    _refresh_installed_desktop_apps(project_root / "apps/desktop")
+
+
+def build_update_products(project_root: Path, *, desktop: bool,
+                          desktop_optional: bool = False) -> None:
+    """Prepare the selected union once; a failed product aborts the update.
+
+    ``desktop_optional`` is for the launch repair tail only. There the desktop product is a
+    *refresh* of artifacts that already exist, and a desktop build this checkout cannot
+    finish must not fail the whole tail: the marker would survive, and the next CLI start
+    would re-run every build again — a permanent retry loop on every command (t_f6924d31).
+    """
     # Both current updates and historical takeover reach this in a fresh target
     # interpreter, never in the updater's pre-sync import graph.
     from hermes_cli.main_install_repair import _warn_configured_features_missing_deps
@@ -121,16 +143,13 @@ def build_update_products(project_root: Path, *, desktop: bool) -> None:
         publish_stage("Building the web UI")
         build_source_web(project_root, env=env)
     if desktop:
-        from hermes_cli.main_desktop import _refresh_installed_desktop_apps, build_prepared_desktop
-
-        publish_stage("Building the desktop app")
-        build_prepared_desktop(
-            project_root / "apps/desktop", source_mode=False,
-            npm=shutil.which("npm", path=env["PATH"]), env=env, icons=project_root,
-        )
-        # A current release/ can still sit beside a stale installed copy (an earlier
-        # update rebuilt but never installed); healing must not wait for the next build.
-        _refresh_installed_desktop_apps(project_root / "apps/desktop")
+        try:
+            _build_desktop_product(project_root, env=env)
+        except Exception as exc:  # noqa: BLE001 — see desktop_optional below
+            if not desktop_optional:
+                raise
+            print(f"  ⚠ Desktop app rebuild failed ({exc}); keeping the installed desktop app")
+            print("    Run `hermes desktop` from a terminal to rebuild it.")
     # A configured memory provider that no longer ships in core is installed from the
     # catalog for every profile home sharing this venv (config, data and tool names
     # unchanged). The update must finish even if the migration blows up.

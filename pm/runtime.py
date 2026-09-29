@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 from typing import Callable
+import time
 import uuid
 
 from pm.package import InstallError
@@ -123,6 +124,53 @@ def _hold_for_children(environment: Path) -> None:
         _HELD[environment] = lease_directory(environment)
 
 
+_PREPARE_LOCK_TIMEOUT_SECONDS = 30.0
+
+
+def _prepare_lock_holder(lock: Path) -> str:
+    """Describe whatever holds *lock* right now, for a message a human can act on.
+
+    Best effort and time-boxed: this runs on the very path that is already blocked, so it
+    must never itself stall — the probe is capped well under the lock bound, and a probe that
+    times out costs nothing but the missing detail. It reports the process ids holding or
+    having mapped the file where the platform exposes them.
+    """
+    import subprocess as _subprocess
+
+    probe_timeout = min(2.0, _PREPARE_LOCK_TIMEOUT_SECONDS)
+    facts = []
+    pid = os.getpid()
+    if os.name == "nt":
+        try:
+            out = _subprocess.run(
+                ["tasklist", "/FI", "PID ne %d" % pid, "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=probe_timeout).stdout or ""
+            holders = []
+            for line in out.splitlines():
+                first = line.split(",")[0].strip().strip('"')
+                if first and first.lower() not in ("info:", "image name"):
+                    holders.append(first)
+            if holders:
+                facts.append("running processes that may hold it: %s"
+                             % ", ".join(sorted(set(holders))[:8]))
+        except Exception:
+            pass
+    else:
+        try:
+            out = _subprocess.run(["lsof", "-t", str(lock)], capture_output=True,
+                                  text=True, timeout=probe_timeout).stdout or ""
+            pids = [p for p in out.split() if p.isdigit() and p != str(pid)]
+            if pids:
+                facts.append("holding pids: %s" % ", ".join(pids[:8]))
+        except Exception:
+            pass
+    try:
+        facts.append("lock age: %.0fs" % max(0.0, time.time() - lock.stat().st_mtime))
+    except OSError:
+        pass
+    return "; ".join(facts) if facts else "holder unknown"
+
+
 def prepare_runtime(uv: Path, python: Path, root: Path, *, offline: bool = False,
                     project: Path | None = None, bootstrap: bool = True,
                     cache: Path | None = None) -> Path:
@@ -130,6 +178,16 @@ def prepare_runtime(uv: Path, python: Path, root: Path, *, offline: bool = False
 
     Generations are immutable after publication. Failed preparation leaves the
     previous generation intact, including when an old worker is still running.
+
+    The lock wait is BOUNDED (``_PREPARE_LOCK_TIMEOUT_SECONDS``). It used to be
+    ``lock_fd(lock.fileno(), wait=True)`` with no timeout, so one process inside
+    ``stage_runtime()`` blocked every ``hermes`` CLI call for as long as that stage took —
+    and since a diverged ``selected.json`` identity skips the fast path below, every caller
+    re-staged and re-held the same global lock. Measured on this host: a delivery child's
+    silent startup burned 1184s of an 1800s wall, i.e. 66% of its wall in this wait, and the
+    platform's own CLI-health probe reported "boot path did not return in 60s". The timeout
+    RAISES rather than staging without the lock: staging unserialized would corrupt the
+    generation that other workers import.
     """
     from pm.filesystem import lock_fd
     from pm.lock import _write
@@ -139,8 +197,17 @@ def prepare_runtime(uv: Path, python: Path, root: Path, *, offline: bool = False
     identity = _inputs(project, python)
     env = runtime_environment()
     root.mkdir(parents=True, exist_ok=True)
-    with (root / ".prepare.lock").open("a+b") as lock:
-        lock_fd(lock.fileno(), wait=True)
+    lock_path = root / ".prepare.lock"
+    with lock_path.open("a+b") as lock:
+        if not lock_fd(lock.fileno(), wait=True, timeout=_PREPARE_LOCK_TIMEOUT_SECONDS):
+            raise InstallError(
+                "pm-runtime",
+                "another process has held the runtime prepare lock for more than "
+                "%.0fs (%s)" % (_PREPARE_LOCK_TIMEOUT_SECONDS, lock_path),
+                "this is a WEDGE, not a slow install: every `hermes` CLI call is blocked "
+                "behind it. Wrote: %s. Check whether a stale `selected.json` identity makes "
+                "each call re-stage (`hermes doctor`), then retry; do not delete the lock "
+                "while a stage is in flight." % _prepare_lock_holder(lock_path))
         selected = root / "selected.json"
         try:
             fact = json.loads(selected.read_text(encoding="utf-8"))
