@@ -66,8 +66,16 @@ def test_metadata_query_never_waits_on_source_completion(tmp_path, monkeypatch, 
     assert venv_sync.prepare_launch(root, argv) is None
 
 
-def test_failed_completion_tail_is_retried_without_rebuilding_dependencies(tmp_path, monkeypatch, completion_tail):
-    """Dependencies committed, tail failed: the next launch owes the tail only."""
+def test_failed_completion_tail_is_not_retried_on_every_launch(tmp_path, monkeypatch, completion_tail):
+    """Dependencies committed, tail failed: the tail is attempted ONCE per obligation.
+
+    Deliberate divergence from "retry the tail on the next launch" (t_f6924d31): a tail that
+    cannot finish re-ran for minutes on EVERY ``hermes`` invocation, for every command, in
+    every profile — measured on a fleet host at 73s / 182.08s / 314.87s per call, unbounded,
+    reported as a normal CLI banner. The obligation survives in the marker for ``hermes
+    update``, which owns it; a FRESH obligation is still attempted exactly once.
+    Guard: virtengine-ops/bin/check-source-completion-retry-loop.py.
+    """
     import pm
     from hermes_cli import _launchers
 
@@ -88,18 +96,36 @@ def test_failed_completion_tail_is_retried_without_rebuilding_dependencies(tmp_p
         venv_sync.prepare_launch(root, [])
     assert len(syncs) == 1 and len(completion_tail) == 1
     assert pm.venv_is_current()
+    pending = venv_sync.completion_pending_path(root)
+    generation = venv_sync._pending_generation(pending)
+    assert generation
+    assert "origin: venv_sync._finish_source_update (current=False)" in pending.read_text()
 
-    with pytest.raises(RuntimeError, match="run `hermes update`"):
-        venv_sync.prepare_launch(root, [])
+    # A retry update's prepare phase must preserve a spent obligation instead of rearming it
+    # with a fresh identity. The updater's own completion tail is the recovery owner.
+    attempt_before = venv_sync.completion_attempt_path(root).read_text()
+    from hermes_cli import update_completion
+    assert update_completion._arm_completion_for_update(root) == pending
+    assert venv_sync._pending_generation(pending) == generation
+    assert venv_sync.completion_attempt_path(root).read_text() == attempt_before
+    assert venv_sync.tail_already_attempted(root, pending)
+
+    # The second launch does NOT raise: this obligation has spent its one attempt, so the
+    # launch path prints the remedy and RETURNS (venv_sync.py:412-421). The dependency
+    # generation committed above is current, so it owes no re-exec (`is None`) — what stops
+    # is the TAIL; the obligation itself survives in the marker for `hermes update`.
+    assert venv_sync.prepare_launch(root, []) is None
     assert len(syncs) == 1, "current dependencies were rebuilt for a tail retry"
-    assert len(completion_tail) == 2
+    assert len(completion_tail) == 1, "the same obligation re-ran the tail on the next launch"
 
+    # A NEW obligation is still owed a tail of its own (the crash-recovery path).
+    venv_sync.arm_completion(root, fresh=True)
     completion_tail.exit_code = 0
     # Dependencies are already this interpreter's: the tail alone owes no re-exec.
     assert venv_sync.prepare_launch(root, []) is None
-    assert len(syncs) == 1 and len(completion_tail) == 3
+    assert len(syncs) == 1 and len(completion_tail) == 2
     assert venv_sync.prepare_launch(root, []) is None
-    assert len(completion_tail) == 3, "a finished tail was run again"
+    assert len(completion_tail) == 2, "a finished tail was run again"
 
 
 def test_completion_tail_output_stays_off_stdout(tmp_path, monkeypatch, completion_tail):
@@ -188,8 +214,22 @@ def test_non_self_or_pm_launch_cannot_trigger_update(tmp_path, monkeypatch, owne
     assert venv_sync.prepare_launch(root, argv) is None
 
 
-def test_failed_launch_keeps_previous_completion_and_retries(tmp_path, monkeypatch):
+def test_failed_launch_keeps_previous_completion_and_stops_resyncing(tmp_path, monkeypatch):
+    """A transient sync failure is attempted ONCE per obligation, then handed to `hermes update`.
+
+    DECISION (t_f6924d31 semantics, t_5f5e6615): the launch path gets exactly one attempt at
+    an obligation — sync included — because re-entering it on every command is the wedge this
+    marker class exists to end (a prepare-lock stage costs 30s+ per attempt; measured 73s-192s
+    per `hermes` invocation, every command, every profile). The state that must NOT exist is
+    the third one: the later launch RETURNING a store interpreter while `venv_is_current()` is
+    still False, which makes hermes_bootstrap re-exec into a process that recomputes the same
+    state forever. So a later launch must RAISE the terminal remedy, and the launcher then runs
+    on the previous dependency generation — intact, because a failed sync commits nothing.
+
+    Guard: virtengine-ops/bin/check-source-completion-retry-loop.py (step 8 pins this).
+    """
     import pm
+    from hermes_cli import _launchers
     root = tmp_path / "checkout"
     root.mkdir()
     (root / ".git").mkdir()
@@ -203,16 +243,26 @@ def test_failed_launch_keeps_previous_completion_and_retries(tmp_path, monkeypat
     previous = '{"packages":{"venv":{"stamp":"previous","extras":["all","anthropic"]}}}'
     fact.write_text(previous)
     monkeypatch.setattr(pm, "venv_is_current", lambda **kw: False)
+    # A store interpreter really exists in production: without this, the too-late launch
+    # fails for the missing interpreter instead of for the state under test.
+    monkeypatch.setattr(_launchers, "resolve_store_python", lambda _: Path(sys.executable))
     calls = []
     def fail(extras, **kwargs):
         calls.append(extras)
         raise RuntimeError("network unavailable")
     monkeypatch.setattr(pm, "sync_venv", fail)
+    outcomes = []
     for _ in range(2):
-        with pytest.raises(RuntimeError, match="network unavailable"):
+        with pytest.raises(RuntimeError) as caught:
             venv_sync.prepare_launch(root, [])
+        outcomes.append(str(caught.value))
         assert fact.read_text() == previous
-    assert calls == [None, None]
+    assert "network unavailable" in outcomes[0], outcomes[0]
+    assert "run `hermes update`" in outcomes[1], (
+        "the launch after a failed sync did not raise the terminal remedy: with the "
+        "dependencies stale, prepare_launch hands the launcher a store interpreter and the "
+        "relaunch never terminates. Got: %s" % outcomes[1])
+    assert calls == [None], "the transient failure was re-synced on the next launch"
     assert not (root / ".update-incomplete").exists()
 
 
