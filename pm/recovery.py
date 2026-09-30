@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from pm.package import InstallError
+from pm.win32 import popen_kwargs
 
 
 STARTUP_IMPORTS = (
@@ -42,7 +43,8 @@ def validate_environment(python: Path, *, env: dict, cwd: Path) -> None:
         "        assert bundle.is_file() and bundle.stat().st_size >= 1024, 'CA bundle is missing'\n"
     )
     result = subprocess.run([str(python), "-I", "-c", script], cwd=cwd, env=env,
-                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+                            **popen_kwargs())
     if result.returncode:
         raise InstallError("venv", f"startup validation failed: {result.stderr.strip()[-1000:]}")
 

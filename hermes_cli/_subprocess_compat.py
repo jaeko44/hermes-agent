@@ -31,6 +31,7 @@ __all__ = [
     "selected_git_env",
     "expose_pm_git",
     "noninteractive_git_env",
+    "internal_git_spawn_kwargs",
     "NO_DRIVER_DIFF_FLAGS",
     "NO_LAZY_FETCH_ENV",
     "pid_is_hermes",
@@ -464,6 +465,44 @@ def noninteractive_git_env(base: "Mapping[str, str] | None" = None) -> dict[str,
         env[f"GIT_CONFIG_KEY_{idx}"] = key
         env[f"GIT_CONFIG_VALUE_{idx}"] = value
     return env
+
+
+def internal_git_spawn_kwargs(base: "Mapping[str, str] | None" = None) -> dict:
+    """Spawn kwargs for a non-interactive, internal git child: no console, no fsmonitor.
+
+    Bundles the two defects that make a background ``git`` call misbehave on
+    Windows, so a call site gets both by splatting one dict:
+
+        subprocess.run(["git", ...], **internal_git_spawn_kwargs(), ...)
+
+    1. **Console window** — :func:`windows_hide_flags`. A console-subsystem git
+       spawned without ``CREATE_NO_WINDOW`` from a console-less parent (pythonw
+       gateway, kanban worker, Desktop) allocates its own console, and the
+       default terminal app renders it as a real window that steals focus. Same
+       defect class as the pinned ``uv.exe`` popups in ``pm``.
+
+    2. **fsmonitor daemon pressure** — :func:`noninteractive_git_env` pins
+       ``core.fsmonitor=false``/``core.untrackedCache=false``. A repo-local
+       ``core.fsmonitor=true`` otherwise applies to every child inheriting the
+       ambient config, and git registers a detached ``git fsmonitor--daemon``
+       per repository. Note this is *reuse*, not one-per-call: measured on this
+       host, 12 consecutive queries under the ambient env produced **1** new
+       daemon, same as 12 under the override. So this leg is hygiene (it stops
+       Hermes from *causing* daemon registrations, and matches the isolation
+       every other internal git path already has) — it is NOT a fix for an
+       existing daemon pile, and it is not what suppresses the window. Leg (1)
+       is the one that fixes the pop.
+
+    Both only bite on the *ambient-env* path: a site that already threads
+    :func:`noninteractive_git_env` through (e.g. :func:`bounded_git_probe`) is
+    immune to (2), and Windows sites already passing ``creationflags`` are
+    immune to (1). Use this for internal plumbing only — the agent-facing
+    terminal tool has its own policy layer and a visible PTY.
+    """
+    kwargs: dict = {"env": noninteractive_git_env(base)}
+    if IS_WINDOWS:
+        kwargs["creationflags"] = windows_hide_flags()
+    return kwargs
 
 
 def posix_is_zombie(pid: int) -> bool:

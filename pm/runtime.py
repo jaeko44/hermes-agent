@@ -16,6 +16,7 @@ from typing import Callable
 import uuid
 
 from pm.package import InstallError
+from pm.win32 import popen_kwargs
 
 
 def runtime_environment() -> dict[str, str]:
@@ -100,7 +101,7 @@ def _validate(python: Path, env: dict[str, str]) -> str:
         checked = subprocess.run(
             [str(python), "-I", "-B", "-c",
              "import packaging, tomli_w, truststore; from ruamel.yaml import YAML"],
-            env=env, capture_output=True, text=True, timeout=30,
+            env=env, capture_output=True, text=True, timeout=30, **popen_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return str(exc)
@@ -270,5 +271,5 @@ def runtime_command(script: Path, args: tuple[str, ...] | list[str] = (), *,
 
 def run_cli(argv: list[str]) -> int:
     result = subprocess.run(runtime_command(Path(__file__).with_name("launch.py"), argv),
-                            env=runtime_environment())
+                            env=runtime_environment(), **popen_kwargs())
     return result.returncode

@@ -8,6 +8,8 @@ import subprocess
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Optional
 
+from pm.win32 import IS_WINDOWS, hide_flags
+
 if TYPE_CHECKING:
     from pm.store import Store
 
@@ -348,5 +350,13 @@ class Runner:
         self.env = env
 
     def run(self, cmd, **kwargs) -> subprocess.CompletedProcess:
+        """Run *cmd* in this package's composed environment.
+
+        Suppresses the Windows console by default (a caller-supplied
+        ``creationflags`` still wins) so a console-less parent — pythonw gateway,
+        kanban worker, Desktop — doesn't get a visible window per run.
+        """
         kwargs.setdefault("env", self.env)
+        if IS_WINDOWS:
+            kwargs.setdefault("creationflags", hide_flags())
         return subprocess.run(cmd, **kwargs)

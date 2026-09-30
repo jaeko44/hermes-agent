@@ -102,6 +102,7 @@ def installed_extras(repo_dir: Path, venv_dir: Path, *, python_exe: Path) -> lis
     import subprocess
 
     from pm.extras import _anchors
+    from pm.win32 import popen_kwargs
 
     required = {extra: _anchors(extra) for extra in declared_extras(repo_dir)}
     anchors = sorted({anchor for group in required.values() for anchor in group})
@@ -128,7 +129,7 @@ print(json.dumps(result))
             [str(python_exe), "-B", "-I", "-S", "-c", probe,
              str(venv_dir.resolve()), json.dumps(anchors)],
             cwd=repo_dir, capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=60, check=True,
+            errors="replace", timeout=60, check=True, **popen_kwargs(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         detail = (getattr(exc, "stderr", None) or str(exc)).strip()

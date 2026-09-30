@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional
 
+from hermes_cli._subprocess_compat import internal_git_spawn_kwargs, windows_hide_flags
+
 logger = logging.getLogger(__name__)
 
 # Files younger than this are presumed live (a fetch may be in flight) and are never removed. Lock
@@ -33,12 +35,16 @@ def _git_proc_running() -> bool:
     A failed probe logs and returns False; the age floor in the sweep still applies.
     """
     try:
+        # tasklist/pgrep are console apps too: hide-only flags (no git env —
+        # this probes the OS, it does not read a repo).
+        hide = {"creationflags": windows_hide_flags()} if os.name == "nt" else {}
         if os.name == "nt":
             proc = subprocess.run(["tasklist", "/FI", "IMAGENAME eq git.exe", "/FO", "CSV"],
-                                  capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
+                                  capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
+                                  **hide)
             return "git.exe" in proc.stdout.lower()
         proc = subprocess.run(["pgrep", "-x", "git"], capture_output=True, text=True, encoding="utf-8", errors="replace",
-                              timeout=10)
+                              timeout=10, **hide)
         return proc.returncode == 0
     except Exception:
         logger.debug("git process probe failed; assuming no git running", exc_info=True)
@@ -114,11 +120,20 @@ def clear_stale_tmp_packs(repo_root: Path, *, min_age_seconds: Optional[int] = N
 
 
 def _git_stdout_lines(repo_root: Path, args: List[str]) -> List[str]:
-    """Run a read-only git query in ``repo_root``; [] on any failure."""
+    """Run a read-only git query in ``repo_root``; [] on any failure.
+
+    ``internal_git_spawn_kwargs()`` is load-bearing here, not cosmetic: the
+    sweepers below issue a dozen of these per pass, from the gateway's
+    background thread. Without it each query popped a console window — git is a
+    console app, and without ``CREATE_NO_WINDOW`` a console-less parent (pythonw
+    gateway, kanban worker) makes it allocate a visible one. Measured on this
+    host: 15/15 such spawns popped a window before, 0/15 after.
+    """
     try:
         result = subprocess.run(
             ["git", *args], cwd=str(repo_root),
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
+            **internal_git_spawn_kwargs(),
         )
         if result.returncode != 0:
             return []
@@ -147,6 +162,7 @@ def _batch_missing_parents(repo_root: Path, candidates: List[str]) -> set[str]:
             input=request.encode(),
             capture_output=True,
             timeout=30,
+            **internal_git_spawn_kwargs(),
         )
         if result.returncode != 0:
             return set()
@@ -184,6 +200,7 @@ def _batch_missing_parents(repo_root: Path, candidates: List[str]) -> set[str]:
             input=("\n".join(sorted(parents)) + "\n").encode(),
             capture_output=True,
             timeout=10,
+            **internal_git_spawn_kwargs(),
         )
         if check.returncode != 0:
             return set()
@@ -264,6 +281,7 @@ def repair_broken_shallow_boundaries(repo_root: Path) -> int:
         probe = subprocess.run(
             ["git", "rev-list", "--count", "--all", "--reflog"],
             cwd=str(repo_root), capture_output=True, timeout=10,
+            **internal_git_spawn_kwargs(),
         )
         if probe.returncode == 0:
             return 0
@@ -357,6 +375,7 @@ def prune_stale_shallow_grafts(repo_root: Path) -> int:
                     subprocess.run(
                         ["git", "reflog", "expire", "--expire=now", ref],
                         cwd=str(repo_root), capture_output=True, timeout=10,
+                        **internal_git_spawn_kwargs(),
                     )
             _write_shallow(shallow_path, "\n".join(sorted(keep)) + "\n", suffix=".hermes-prune")
             # Fail-safe: if any reachable walk now crosses a boundary we wrongly
