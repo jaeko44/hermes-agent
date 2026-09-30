@@ -13,6 +13,7 @@ from pm import paths, plugin_inputs
 from pm.package import InstallError, Runner, StatePackage
 from pm.plugin_inputs import Candidates, Members, PluginInput, Selection
 from pm.runtime import is_runtime, runtime_command, runtime_environment
+from pm.win32 import popen_kwargs
 from pm.worker_operations import OPERATIONS
 
 
@@ -113,8 +114,14 @@ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_
     stopped = threading.Event()
     write_lock = threading.Lock()
     monitor = None
+    # Hide-only. This worker is the parent of every uv.exe spawn pm makes, so
+    # when the caller is console-less (pythonw gateway, kanban worker, Desktop)
+    # the worker used to allocate a visible console of its own — and then each
+    # uv.exe descendant allocated another. Giving the worker a HIDDEN console
+    # makes the whole subtree inherit an invisible one.
     with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          text=True, encoding="utf-8", env=environment) as process:
+                          text=True, encoding="utf-8", env=environment,
+                          **popen_kwargs()) as process:
         assert process.stdin is not None and process.stdout is not None
         writer = process.stdin
 

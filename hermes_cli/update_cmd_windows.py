@@ -658,9 +658,14 @@ def _win_service(name: str):
 
 def _sc_exe(verb: str, name: str, service, settled_status: str) -> None:
     """``sc.exe <verb> <name>``; a non-zero exit is only an error when SCM doesn't already report *settled_status*."""
+    from hermes_cli._subprocess_compat import windows_hide_flags
+
+    # sc.exe is a console app: from a console-less parent (the Desktop's
+    # post-update restart, a windowless gateway) a bare spawn allocated a
+    # visible console. Hide-only; stdio stays piped for the error text below.
     result = subprocess.run(
         ["sc.exe", verb, name], capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=10, check=False,
+        timeout=10, check=False, creationflags=windows_hide_flags(),
     )
     if result.returncode != 0 and service.status() != settled_status:
         detail = (result.stderr or result.stdout).strip()

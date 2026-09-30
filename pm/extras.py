@@ -167,12 +167,13 @@ def _evaluate_in_runtime(marker: str, environment: dict[str, str]) -> bool:
     import subprocess
 
     from pm.runtime import runtime_command, runtime_environment
+    from pm.win32 import popen_kwargs
 
     try:
         command = runtime_command(Path(__file__).with_name("_marker_eval.py"),
                                   [marker, json.dumps(environment)])
         result = subprocess.run(command, env=runtime_environment(), capture_output=True,
-                                text=True, timeout=60)
+                                text=True, timeout=60, **popen_kwargs())
     except Exception:
         return True  # same fallback as a malformed marker: the resolver decides
     if result.returncode != 0:

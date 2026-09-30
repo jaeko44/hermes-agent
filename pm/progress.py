@@ -20,6 +20,8 @@ import sys
 import time
 from typing import IO, Callable, Mapping, Optional, Protocol, Sequence
 
+from pm.win32 import IS_WINDOWS, hide_flags
+
 TAIL_LINES = 80
 # A child that never prints a newline (a bare progress stream, a binary blob) must not
 # grow memory without bound; the end of an over-long line is the informative part.
@@ -136,7 +138,15 @@ class LiveTail:
 def run_contained(command: Sequence[str], label: str, *, stream: Optional[IO[str]] = None,
                   hide: Optional[Callable[[str], bool]] = None, indent: str = "",
                   **kwargs) -> subprocess.CompletedProcess:
-    """``subprocess.run(check=True)`` under the output policy."""
+    """``subprocess.run(check=True)`` under the output policy.
+
+    Console-suppression is applied here rather than at each call site: this is
+    the wrapper pm's install/build operations go through, and its children are
+    console binaries (uv.exe, node, npm, python) that allocate a visible window
+    when pm's parent is console-less. A caller-supplied ``creationflags`` in
+    ``kwargs`` wins, so an intentional override is still expressible.
+    """
+    kwargs = {"creationflags": hide_flags(), **kwargs} if IS_WINDOWS else kwargs
     if verbose_output():
         out = sys.stdout if stream is None else stream
         out.write(f"{indent}→ {label}…\n")

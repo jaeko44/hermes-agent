@@ -31,6 +31,7 @@ from collections.abc import Mapping
 
 from pm import paths
 from pm.lock import Facts
+from pm.win32 import popen_kwargs
 
 
 def _staged_bash() -> str | None:
@@ -96,8 +97,7 @@ def _bash_starts(candidate: str) -> bool:
         return subprocess.run(
             [candidate, "-c", "exit 0"], stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            check=False,
+            timeout=5, check=False, **popen_kwargs(),
         ).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False

@@ -21,6 +21,7 @@ from typing import TextIO
 
 from pm.package import InstallError
 from pm.progress import LiveTail, TextSink, verbose_output
+from pm.win32 import popen_kwargs
 
 # Slow steps get a status line; unlisted quick ones (venv, export, pip check)
 # stay silent unless they fail.
@@ -142,8 +143,13 @@ def _run_streaming(command: list[str], *, cwd: Path, env: dict[str, str],
                    timeout: int, output: TextSink) -> subprocess.CompletedProcess:
     """Keep CI progress live, a bounded diagnostic tail, and a wall-clock timeout."""
     deadline = time.monotonic() + timeout
+    # Hide-only: pm's highest-frequency spawn is the pinned uv.exe below, and pm
+    # is driven mostly by console-less parents (pythonw gateway, kanban workers,
+    # Desktop), so a bare spawn allocated a visible console per call. The hidden
+    # console this child owns is inherited by every descendant uv spawns.
     proc = subprocess.Popen(command, cwd=str(cwd), env=env, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=0)
+                            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=0,
+                            **popen_kwargs())
     pipe = proc.stdout
     assert isinstance(pipe, io.TextIOWrapper)  # Popen was given stdout=PIPE and text=True.
     tail = ""
@@ -315,7 +321,8 @@ class PythonEnvironment:
                     tail.close(result.returncode == 0)
                     return result
                 return subprocess.run(command, cwd=str(cwd), env=env, capture_output=True,
-                                      text=True, encoding="utf-8", errors="replace", timeout=timeout)
+                                      text=True, encoding="utf-8", errors="replace", timeout=timeout,
+                                      **popen_kwargs())
             except subprocess.TimeoutExpired as exc:
                 from pm.index_config import TIMEOUT_HINT
 

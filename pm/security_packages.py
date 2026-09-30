@@ -14,6 +14,7 @@ from pm.package import InstallError
 from pm.packages import BinaryPackage, _RUST_TRIPLE
 from pm.registry import register
 from pm.store import MUSL_TARGETS, flatten_single_dir
+from pm.win32 import popen_kwargs
 
 
 @register
@@ -144,11 +145,12 @@ class IronProxy(_SignedBinary):
             if not signature.is_file() or not key.is_file():
                 raise InstallError(self.name, "pinned signature assets missing")
             imported = subprocess.run([*args, "--import", str(key)], stdin=subprocess.DEVNULL,
-                                      capture_output=True, timeout=60, check=False)
+                                      capture_output=True, timeout=60, check=False, **popen_kwargs())
             if imported.returncode:
                 logging.getLogger(__name__).warning("Could not import iron-proxy signing key; archive checksum remains enforced")
                 return
             verified = subprocess.run([*args, "--verify", str(signature), str(directory / "checksums.txt")],
-                                      stdin=subprocess.DEVNULL, capture_output=True, timeout=60, check=False)
+                                      stdin=subprocess.DEVNULL, capture_output=True, timeout=60, check=False,
+                                      **popen_kwargs())
             if verified.returncode:
                 raise InstallError(self.name, "GPG signature verification failed")
