@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import pathlib
 import threading
 import time
@@ -13,7 +14,8 @@ from gateway.shutdown_watchdog import (
     start_loop_liveness_watchdog,
 )
 
-def test_loop_liveness_watchdog_stop_during_dump_disarms_hard_exit():
+def test_loop_liveness_watchdog_stop_during_dump_disarms_hard_exit(tmp_path, monkeypatch):
+    monkeypatch.setattr("gateway.shutdown_watchdog._process_hermes_home", lambda: tmp_path)
     loop = MagicMock(spec=asyncio.AbstractEventLoop)
     handle_ready = threading.Event()
     handle_ref = {}
@@ -41,7 +43,9 @@ def test_loop_liveness_watchdog_stop_during_dump_disarms_hard_exit():
 
     assert not handle.is_alive()
     critical.assert_called_once()
-    dump.assert_called_once_with(all_threads=True)
+    dump.assert_called_once()
+    assert dump.call_args.kwargs["file"] is not None
+    assert dump.call_args.kwargs["all_threads"] is True
     assert exit_codes == []
 
 def test_loop_liveness_watchdog_stop_during_final_miss_disarms_hard_exit():
@@ -138,6 +142,65 @@ def test_loop_liveness_watchdog_stop_after_first_recheck_skips_final_actions():
     critical.assert_not_called()
     dump.assert_not_called()
     hard_exit.assert_not_called()
+
+def test_loop_liveness_watchdog_persists_blocking_frame_before_exit(tmp_path, monkeypatch):
+    loop = asyncio.new_event_loop()
+    loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
+    block_started = threading.Event()
+    release_block = threading.Event()
+    exit_called = threading.Event()
+    dump_path = tmp_path / "logs" / "gateway-loop-liveness-watchdog.log"
+    exit_observation = {}
+    handle = None
+
+    def blocking_frame():
+        block_started.set()
+        release_block.wait(timeout=5.0)
+
+    def fake_exit(code: int) -> None:
+        exit_observation["code"] = code
+        exit_observation["dump_exists"] = dump_path.is_file()
+        if dump_path.is_file():
+            exit_observation["dump_content"] = dump_path.read_text(encoding="utf-8")
+        exit_called.set()
+
+    monkeypatch.setattr(
+        "gateway.shutdown_watchdog._process_hermes_home", lambda: tmp_path
+    )
+    monkeypatch.setattr("gateway.shutdown_watchdog._mark_exited_quietly", lambda *_args: None)
+    monkeypatch.setattr("gateway.shutdown_watchdog.os._exit", fake_exit)
+    monkeypatch.setattr("gateway.shutdown_watchdog.logger.critical", lambda *_args: None)
+
+    try:
+        loop_thread.start()
+        loop.call_soon_threadsafe(blocking_frame)
+        assert block_started.wait(timeout=2.0), "event loop did not enter the blocking callback"
+
+        handle = start_loop_liveness_watchdog(
+            loop, probe_interval=0.01, probe_timeout=0.02, max_strikes=1
+        )
+        assert handle is not None
+        assert exit_called.wait(timeout=3.0), "watchdog did not reach its restart exit"
+        handle.join(timeout=1.0)
+    finally:
+        release_block.set()
+        if handle is not None:
+            handle.stop()
+            handle.join(timeout=1.0)
+        if loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(timeout=2.0)
+        loop.close()
+
+    assert exit_observation["code"] == 75
+    assert exit_observation["dump_exists"] is True
+    dump_content = exit_observation["dump_content"]
+    record = json.loads(dump_content.splitlines()[0])
+    assert record["event"] == "loop_liveness_watchdog_fired"
+    assert record["strikes"] == 1
+    assert "blocking_frame" in dump_content
+    assert "--- end dump ---" in dump_content
+
 
 def test_gateway_config_loop_watchdog_round_trip():
     """loop_watchdog is a config.yaml knob: default on, nested-gateway form honored."""
@@ -257,10 +320,11 @@ def test_load_gateway_config_bridges_loop_watchdog_keys(tmp_path, monkeypatch):
     assert cfg.loop_watchdog_probe_timeout_s == 15.0
     assert cfg.loop_watchdog_max_strikes == 12
 
-def test_loop_liveness_watchdog_marks_runtime_degraded_before_restart():
+def test_loop_liveness_watchdog_marks_runtime_degraded_before_restart(tmp_path, monkeypatch):
     """The terminal watchdog observation must be visible before ``os._exit``."""
     from gateway.status import read_runtime_status, write_runtime_status
 
+    monkeypatch.setattr("gateway.shutdown_watchdog._process_hermes_home", lambda: tmp_path)
     write_runtime_status(gateway_state="running", exit_reason=None)
     loop = MagicMock(spec=asyncio.AbstractEventLoop)
     fired = threading.Event()

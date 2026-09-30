@@ -43,6 +43,8 @@ DEFAULT_LOOP_WATCHDOG_TIMEOUT_S = 10.0
 DEFAULT_LOOP_WATCHDOG_MAX_STRIKES = 3
 _HEARTBEAT_RELATIVE = ("state", "gateway.heartbeat")
 _WATCHDOG_DUMP_RELATIVE = ("logs", "gateway-shutdown-watchdog.log")
+_LOOP_LIVENESS_DUMP_RELATIVE = ("logs", "gateway-loop-liveness-watchdog.log")
+_LOOP_LIVENESS_DUMP_WRITE_TIMEOUT_S = 2.0
 
 
 def _coerce_float(value: Any, default: float, floor: float = 0.0) -> float:
@@ -84,6 +86,47 @@ def _arm_loop_floor_timer(
     return _LoopFloorTimerHandle(loop, iv if iv > 0 else DEFAULT_LOOP_FLOOR_TIMER_INTERVAL_S)
 
 
+def _persist_loop_liveness_watchdog_dump(*, strikes: int, exit_code: int) -> None:
+    """Write all thread stacks to HERMES_HOME before the liveness restart.
+
+    File I/O runs on a daemon helper with a bounded wait: a wedged filesystem must
+    not turn this restart watchdog into another indefinitely blocked thread.
+    """
+    try:
+        dump_path = get_loop_liveness_watchdog_dump_path()
+        header = {
+            "event": "loop_liveness_watchdog_fired",
+            "pid": os.getpid(),
+            "strikes": strikes,
+            "exit_code": exit_code,
+            "fired_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        def _write_dump() -> None:
+            try:
+                dump_path.parent.mkdir(parents=True, exist_ok=True)
+                with dump_path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(header) + "\n--- faulthandler dump (all threads) ---\n")
+                    try:
+                        faulthandler.dump_traceback(file=fh, all_threads=True)
+                    except Exception:
+                        fh.write("(faulthandler.dump_traceback failed)\n")
+                    fh.write("--- end dump ---\n")
+                    fh.flush()
+                    with contextlib.suppress(Exception):
+                        os.fsync(fh.fileno())
+            except Exception:
+                pass
+
+        writer = threading.Thread(
+            target=_write_dump, daemon=True, name="gateway-loop-liveness-dump"
+        )
+        writer.start()
+        writer.join(timeout=_LOOP_LIVENESS_DUMP_WRITE_TIMEOUT_S)
+    except Exception:
+        pass
+
+
 def start_loop_liveness_watchdog(
     loop: asyncio.AbstractEventLoop, *, probe_interval: float = DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
     probe_timeout: float = DEFAULT_LOOP_WATCHDOG_TIMEOUT_S,
@@ -123,15 +166,18 @@ def start_loop_liveness_watchdog(
                 continue
             if stop_event.is_set():
                 return
+            _persist_loop_liveness_watchdog_dump(strikes=strikes, exit_code=exit_code)
             with contextlib.suppress(Exception):
                 logger.critical(
                     "Gateway event loop missed %d consecutive liveness probes; dumping all thread "
                     "stacks and exiting with code %d so the service supervisor can restart it.",
                     strikes, exit_code)
+            if stop_event.is_set():
+                return
             try:
                 faulthandler.dump_traceback(all_threads=True)
             except Exception:
-                logger.debug("Loop liveness faulthandler dump failed", exc_info=True)
+                logger.debug("Loop liveness faulthandler stderr dump failed", exc_info=True)
             if stop_event.is_set():
                 return
             _mark_exited_quietly(exit_code, "loop_liveness_watchdog")
@@ -186,6 +232,11 @@ def _home(home: Optional[Path]) -> Path:
 
 def get_loop_heartbeat_path(home: Optional[Path] = None) -> Path:
     return _home(home).joinpath(*_HEARTBEAT_RELATIVE)
+
+
+def get_loop_liveness_watchdog_dump_path(home: Optional[Path] = None) -> Path:
+    """Return ``<HERMES_HOME>/logs/gateway-loop-liveness-watchdog.log``."""
+    return _home(home).joinpath(*_LOOP_LIVENESS_DUMP_RELATIVE)
 
 
 def get_loop_tick_socket_path(home: Optional[Path] = None, pid: Optional[int] = None) -> Path:
