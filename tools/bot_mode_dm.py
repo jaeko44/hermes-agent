@@ -16,6 +16,7 @@ local → ``hermes -p <name> chat --in ~ -c "Bot Chat" --create-if-missing -Q
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import logging
@@ -49,6 +50,10 @@ REPLY_COMPLETION_CHARS = MESSAGE_MAX_CHARS + 2000
 _DM_DIR_NAME = "hermes-dm"
 _DM_STALE_SECONDS = 24 * 60 * 60
 _LIVE_WAIT_SECONDS = 300
+# Resolved once per process: a sender and its peer runner are separate processes that must
+# agree on one rendezvous path, and re-probing an unusable temp root on every message would
+# pay a failing mkdir+chmod+mkstemp on every DM. None = not resolved yet.
+_DM_DIR_CACHED: Optional[Path] = None
 
 # '<peer>/<agent>' — peer names are lowercase (``hermes peer`` normalizes them).
 _PEER_TARGET_RE = re.compile(r"^([a-z0-9][a-z0-9_-]{0,63})/([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})$")
@@ -340,10 +345,74 @@ def _try_relay_delivery(root: Path, raw_target: str, content: str, me: str, *,
         return None
 
 
-def _dm_dir() -> Path:
-    uid_getter = getattr(os, "getuid", None)
-    uid = uid_getter() if callable(uid_getter) else None
-    path = Path(tempfile.gettempdir()) / (f"{_DM_DIR_NAME}-{uid}" if uid is not None else _DM_DIR_NAME)
+def _dm_dir_candidates(uid: int | None) -> list[Path]:
+    """Stable, machine-wide DM directories in preference order.
+
+    Every candidate is per-user and stable across processes: a sender and its peer
+    runner are different processes (often different Hermes profiles) that must
+    rendezvous on the SAME path, so a per-call unique directory would break delivery.
+    """
+    suffix = f"-{uid}" if uid is not None else ""
+    candidates = [Path(tempfile.gettempdir()) / f"{_DM_DIR_NAME}{suffix}"]
+    # A shared temp root is not ours to trust: another account may have created the
+    # directory (or an administrator may have sealed its ACL), and then EVERY peer DM
+    # fails even though Hermes' own per-user storage is perfectly writable. Prefer a
+    # Hermes-owned root when the temp root is unusable. Every candidate must be
+    # machine-wide (NOT per-profile) or the sender and the peer runner - which run
+    # under different profiles - would pick different paths.
+    fallback_roots = []
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        fallback_roots.append(Path(local_app_data))
+    fallback_roots.append(Path.home())
+    for root in fallback_roots:
+        # Keep the fallback inside Hermes' own home where one is known, so it is not
+        # a dotfile dropped into the user's profile directory.
+        if (root / "hermes").is_dir():
+            candidates.append(root / "hermes" / f"{_DM_DIR_NAME}{suffix}")
+        else:
+            candidates.append(root / f"{_DM_DIR_NAME}{suffix}")
+    return candidates
+
+
+def _dm_dir_is_writable(path: Path) -> None:
+    """Raise OSError unless *path* accepts a freshly created file.
+
+    Probed with a single ``os.open`` rather than ``tempfile.mkstemp``: CPython's
+    mkstemp treats a PermissionError on Windows as "name already taken" whenever
+    ``os.access(dir, W_OK)`` lies, and then retries TMP_MAX (10000) times before
+    finally raising — so probing with mkstemp HANGS on exactly the locked directory
+    it is supposed to detect. ``os.access`` answers from the token's granted
+    rights, not from the directory ACL, so it can report W_OK on a directory that
+    denies every create.
+    """
+    probe = path / (".dm-probe-%d" % os.getpid())
+    flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
+    try:
+        fd = os.open(probe, flags, 0o600)
+    except PermissionError:
+        raise
+    except OSError as e:
+        # A leftover probe file from a killed process is not a broken directory:
+        # this account CAN create files here, which is all we need to know.
+        if e.errno == errno.EEXIST:
+            return
+        raise
+    os.close(fd)
+    try:
+        os.unlink(probe)
+    except OSError:
+        pass
+
+
+def _prepare_dm_dir(path: Path, uid: int | None) -> Path:
+    """Create *path* and prove it is usable, or raise OSError.
+
+    ``mkdir(exist_ok=True)`` and ``lstat`` both succeed on a directory whose ACL
+    denies this account, so neither proves the directory is usable — the failure
+    only surfaced later as WinError 5 from the write. Probe the same operation the
+    caller performs instead of trusting the create.
+    """
     path.mkdir(mode=0o700, exist_ok=True)
     # Shared POSIX temp roots need a per-user directory. Fail closed if an
     # attacker pre-created the expected path or replaced it with a symlink.
@@ -352,9 +421,40 @@ def _dm_dir() -> Path:
         raise PermissionError(f"DM temp path is not a directory: {path}")
     if uid is not None and info.st_uid != uid:
         raise PermissionError(f"DM temp directory is owned by another user: {path}")
-    if stat.S_IMODE(info.st_mode) != 0o700:
+    # Only POSIX has a POSIX mode to tighten. Windows reports 0777 for every
+    # directory, so this branch used to fire on every call, and its chmod needs
+    # WRITE_DAC — a hard failure on any directory whose ACL denies it.
+    if uid is not None and stat.S_IMODE(info.st_mode) != 0o700:
         path.chmod(0o700)
+    _dm_dir_is_writable(path)
     return path
+
+
+def _dm_dir() -> Path:
+    global _DM_DIR_CACHED
+    if _DM_DIR_CACHED is not None:
+        return _DM_DIR_CACHED
+    uid_getter = getattr(os, "getuid", None)
+    uid = uid_getter() if callable(uid_getter) else None
+    candidates = _dm_dir_candidates(uid)
+    first_error = None
+    for index, path in enumerate(candidates):
+        try:
+            resolved = _prepare_dm_dir(path, uid)
+        except OSError as e:
+            first_error = first_error or e
+            logger.warning(
+                "DM directory %s unusable (%s: %s); trying the next candidate",
+                path, type(e).__name__, e)
+            continue
+        _DM_DIR_CACHED = resolved
+        if index:
+            # Announced so a fallback is never a silent change of rendezvous path.
+            logger.warning(
+                "using fallback DM directory %s (primary %s was unusable: %s: %s)",
+                resolved, candidates[0], type(first_error).__name__, first_error)
+        return resolved
+    raise first_error
 
 
 def cleanup_bot_dm_cache(max_age_hours: float = _DM_STALE_SECONDS / 3600, *, now: float | None = None) -> int:
