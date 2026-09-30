@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -745,6 +746,13 @@ _BOT_CHAT_STDERR_TAIL = 500
 # stdout is the model's answer; only a short tail is persisted (jobs.json / ledger).
 _BOT_CHAT_STDOUT_TAIL = 200
 _BOT_CHAT_BANNER_PREFIXES = ("Resumed session", "session_id:")
+# How long the wall handler waits for a turn that SURVIVED its own kill to write its report.
+# The wall kill does not stop the turn (the launcher re-spawns the real CLI on Windows), so
+# the digest can land moments after the kill. This is a fraction of the wall itself and it
+# is spent only on a turn that has already been cut, where the alternative is booking a
+# delivered result as a failure; the degraded marker is still queued when it expires.
+_WALL_DIGEST_SETTLE_SECONDS = 30.0
+_WALL_DIGEST_POLL_SECONDS = 0.5
 
 
 def _bot_chat_answer_text(stream) -> str:
@@ -761,8 +769,9 @@ def _bot_chat_answer_text(stream) -> str:
     ).strip()
 
 
-def _bot_chat_turn_reported_a_digest(result, report_file: Optional[str] = None) -> bool:
-    """True when a non-zero-exit delivery child ENDED ITS TURN and produced an answer.
+def _bot_chat_turn_reported_a_digest(result, report_file: Optional[str] = None, *,
+                                    settle_seconds: float = 0.0) -> bool:
+    """True when a delivery child ENDED ITS TURN and produced an answer.
 
     A turn cut by ``--max-turns`` does not fail — it ends as a RESUMABLE BOUNDARY carrying a
     summary of the work it completed. The platform's own ``is_max_iteration_handoff``
@@ -802,6 +811,15 @@ def _bot_chat_turn_reported_a_digest(result, report_file: Optional[str] = None) 
     Positive only: the report must exist, carry no ``error``, and carry a non-empty ``reply``.
     Everything else — no answer, a provider error, an absent/corrupt/foreign report, or a child
     that ended without reporting its turn — falls through to the failure path and blotters.
+
+    *settle_seconds* is for the WALL path, and it is the whole reason this rule can fire
+    there. On the exit path the turn is over before the rule is asked, so the report is
+    already on disk; a wall kill kills only the launcher, and the turn is still running and
+    writes its report a beat later (measured: 30s after a 10s wall). Asking with no settle
+    window is asking too early, so the wall path passes a short bounded wait. It stays a
+    wait, not a second wall: the nonce check, the no-error check and the non-empty-reply
+    check all still have to pass, so this can only ever convert a DELIVERED turn into a
+    delivered booking, never invent a forgiveness.
     """
     if getattr(result, "returncode", 0) == 0:
         return False
@@ -811,7 +829,12 @@ def _bot_chat_turn_reported_a_digest(result, report_file: Optional[str] = None) 
         return False
     from hermes_cli.quiet_single_query import read_turn_report
 
-    record = read_turn_report(report_file, nonce=nonce)
+    deadline = time.monotonic() + max(0.0, float(settle_seconds or 0.0))
+    while True:
+        record = read_turn_report(report_file, nonce=nonce)
+        if record is not None or time.monotonic() >= deadline:
+            break
+        time.sleep(_WALL_DIGEST_POLL_SECONDS)
     if not record:
         return False
     if str(record.get("error") or "").strip():
@@ -1063,7 +1086,23 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
                 f". Details: {tail}")
         logger.info("Job '%s': delivered to Bot Chat of profile '%s'", job_id, profile_label)
         return None
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as wall:
+        # A wall kill is not proof the turn failed. The launcher re-spawns the real CLI on
+        # Windows, so ``proc.kill()`` kills the launcher and the TURN SURVIVES it: the
+        # ``--max-turns`` digest can still be posted into Bot Chat and its report written
+        # moments later (measured: a real cap-cut child posted 30s after its 10s wall).
+        # Booking that as a failure drops a result that was already delivered -- the class
+        # this lane exists to stop. So ask, bounded: the report is attributable only by this
+        # run's own nonce (carried on the exception by ``run_reported_turn``), and the wait
+        # stays far inside the job's own budget because the marker below still has to be
+        # queued either way. A foreign or absent record fails the check and the marker
+        # stands, exactly as before.
+        if _bot_chat_turn_reported_a_digest(wall, None, settle_seconds=_WALL_DIGEST_SETTLE_SECONDS):
+            logger.info(
+                "Job '%s': bot-chat delivery to profile '%s' was cut at the %ss wall but its "
+                "turn reported a digest afterwards; booking it delivered",
+                job_id, profile_label, timeout_s)
+            return None
         # Replaying the full payload risks a duplicate (the killed turn may already have
         # persisted it); staying silent loses the alert entirely (2026-09-19 docgen-deadman
         # case). So queue a SHORT marker that points at the saved output, once per execution

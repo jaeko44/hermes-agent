@@ -227,7 +227,26 @@ def run_reported_turn(argv: list, *, env: MutableMapping[str, str], report_path:
             report = read_turn_report(report_path, proc.pid, nonce=nonce)
             if report is not None:
                 break
-            raise subprocess.TimeoutExpired(argv, timeout)
+            # The wall is the ONE booking path that loses this run's attribution: the caller
+            # holds an exception, not a ReportedTurn, so it has nothing to hand
+            # ``read_turn_report`` and cannot tell a killed-but-answered turn from a dead one.
+            # Stamp the attribution onto the exception so a spawner that wants to ask
+            # (booking a delivered turn instead of a failure) can. The kill does NOT stop the
+            # turn: on Windows the launcher RE-SPAWNS the real CLI, so the writer survives
+            # ``proc.kill()`` and may still post its digest and report moments later.
+            #
+            # ``returncode`` is stamped too, and it is not decoration: the delivery rule
+            # forgives a NON-ZERO exit that ended its turn, and ``TimeoutExpired`` carries no
+            # ``returncode`` at all — so a caller passing the bare exception hits
+            # ``getattr(result, "returncode", 0) == 0`` and the rule returns False before it
+            # reads anything. A killed child did not succeed, so -1 is the honest value (the
+            # conventional signal-termination code), and it keeps the rule reachable here.
+            exc = subprocess.TimeoutExpired(argv, timeout)
+            exc.returncode = -1               # type: ignore[attr-defined]
+            exc.report_file = report_path     # type: ignore[attr-defined]
+            exc.report_nonce = nonce          # type: ignore[attr-defined]
+            exc.child_pid = proc.pid          # type: ignore[attr-defined]
+            raise exc
     # Turn over, child still lingering for a nested reply: not this spawner's wait.
     return _booked(int(report["exit_code"]), report.get("reply") or "", report.get("error") or "")
 
