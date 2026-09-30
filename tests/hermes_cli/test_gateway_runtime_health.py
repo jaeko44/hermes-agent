@@ -96,6 +96,7 @@ def test_runtime_health_lines_render_watchdog_degraded_exit(monkeypatch):
     degraded = [ln for ln in _runtime_health_lines() if ln.startswith("⚠ Gateway exited degraded:")]
     assert len(degraded) == 1
     assert "event loop stopped dispatching" in degraded[0]
+    assert "logs/gateway-loop-liveness-watchdog.log" in degraded[0]
 
     record["exit_reason"] = None
     assert not [ln for ln in _runtime_health_lines() if "degraded" in ln]
