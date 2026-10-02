@@ -580,6 +580,64 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
     return requested, branch_name
 
 
+def is_spawnable_workspace_path(path: Optional[str]) -> bool:
+    """Whether ``resolve_workspace`` would ACCEPT this stored ``workspace_path``.
+
+    The predicate is deliberately IDENTICAL to the resolver's own
+    (``Path(p).expanduser().is_absolute()``, ``resolve_workspace``:542-547 /
+    :602-617) rather than a re-derivation of "absolute": a checker that
+    disagrees with the resolver either lets a card through that dies at spawn
+    (a superset) or refuses a card that would have worked (a subset).
+
+    Probe of the shapes this fleet actually produced (measured 2026-10-03):
+
+        'virtengine'                             REFUSED  (the 2026-09-26/29 class)
+        './virtengine', '../virtengine'          REFUSED
+        '/c/Users/jON/virtengine-ops/virtengine' REFUSED  (MSYS drive path on a Windows host)
+        'dir:C:/Users/jON/virtengine-ops'        REFUSED  (unstripped CLI kind prefix)
+        'worktree:C:/Users/jON/virtengine-ops'   REFUSED
+        '~/virtengine'                           OK       (expanduser makes it absolute)
+        'C:/Users/jON/virtengine-ops/virtengine' OK
+    """
+    if not path or not str(path).strip():
+        return False
+    return Path(str(path)).expanduser().is_absolute()
+
+
+def require_spawnable_workspace_path(path: Optional[str], *, kind: Optional[str], where: str) -> None:
+    """Creation-time guard: refuse to STORE a ``workspace_path`` the resolver
+    would reject, instead of letting the card fail hours later at spawn.
+
+    Why creation and not only resolution: every non-absolute stored path is a
+    card that is born dead. Nothing surfaces it until a dispatcher tick tries
+    to spawn it (minutes or days later), and then the failure mode is a LOOP --
+    ``spawn_failed`` -> ``gave_up`` after ``max_retries`` -> auto-unblock ->
+    ``spawn_failed`` again -- which burns ticks while occupying diagnostics
+    (measured 2026-09-26: ``t_ccad2930`` burned ticks at 19:13/19:14/19:48/
+    19:49 with 0-second runs and no worker; five more cards on 2026-09-29).
+
+    A ``scratch`` task with no path is NORMAL (``resolve_workspace``:597
+    materialises ``<board-root>/workspaces/<id>``), so an empty value is only
+    an error for the persistent kinds that require one.
+
+    The ``scratch``/``dir``/``worktree`` kinds are all affected: a stored
+    ``'dir:C:/x'`` or bare relative path fails at the ``dir`` and ``worktree``
+    branches alike (:602-617, :542-547), and a legacy explicit-path scratch
+    task hits the same guard.
+    """
+    if kind == "scratch" and not (path and str(path).strip()):
+        return
+    if is_spawnable_workspace_path(path):
+        return
+    raise ValueError(
+        f"{where}: workspace_kind={kind or 'scratch'} needs an ABSOLUTE workspace_path, "
+        f"got {path!r}. A relative path is ambiguous against the dispatcher's CWD "
+        f"(confused-deputy traversal) and is refused at spawn, so the card would be "
+        f"born unspawnable. Pass a full path, e.g. 'C:/Users/<you>/<repo>' or "
+        f"'dir:<abs path>'/'worktree:<abs path>' in the CLI's --workspace form."
+    )
+
+
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 

@@ -1340,6 +1340,17 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
+    # Refuse to STORE a path the resolver would reject. Without this the card is
+    # born dead: `resolve_workspace` raises at spawn, the dispatcher logs
+    # spawn_failed, gives up after max_retries, auto-unblocks, and loops.
+    # Measured 2026-09-26 (5 cards) and again 2026-09-29 (5 cards) from cron
+    # workers; the shape reaches here verbatim from the kanban tool
+    # (tools/kanban_tools.py:1044) and the CLI (hermes_cli/kanban.py:366),
+    # whose schema says "Absolute path" but never enforced it.
+    kbw_require_spawnable_workspace_path(
+        workspace_path, kind=workspace_kind, where="kanban create",
+    )
+
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
@@ -4497,6 +4508,9 @@ from hermes_cli.kanban_db_workspace import (  # noqa: E402
     _is_managed_scratch_path,
     _managed_scratch_path_info,
     _scratch_workspace,
+)
+from hermes_cli.kanban_db_workspace import (  # noqa: E402
+    require_spawnable_workspace_path as kbw_require_spawnable_workspace_path,
 )
 from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     DEFAULT_FAILURE_LIMIT,
