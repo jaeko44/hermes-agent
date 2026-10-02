@@ -106,9 +106,38 @@ def test_turn_report_is_written_before_the_exit_linger_and_the_path_is_not_inher
     except SystemExit as exc:
         assert exc.code == 0
     assert seen["env_during_turn"] is None and seen["report_during_turn"] is False
-    assert seen["report_at_linger"] == {"pid": os.getpid(), "exit_code": 0, "error": "", "reply": "ok"}
+    # ``nonce`` is the spawner's own token, echoed back so it can accept only a record it asked
+    # for; absent from the environment here, so it is recorded empty.
+    assert seen["report_at_linger"] == {"pid": os.getpid(), "exit_code": 0, "error": "", "reply": "ok",
+                                        "nonce": ""}
     # Another process's record is not this child's report.
     assert qsq.read_turn_report(str(report), os.getpid() + 1) is None
+
+
+def test_the_report_echoes_the_spawners_nonce_so_it_can_be_attributed(monkeypatch, tmp_path):
+    """A spawner accepts only a report carrying ITS token.
+
+    The record's ``pid`` cannot identify the writer on Windows: the launcher re-spawns the CLI
+    (``hermes_bootstrap`` -> ``subprocess.call``), so the writer is a grandchild whose pid never
+    equals the launched one. The nonce is what actually holds there, and it must be echoed from
+    the environment WITHOUT the child having to thread it through, or a child that simply writes
+    its report becomes unreadable to the spawner that asked for it (t_4260d321).
+    """
+    report = tmp_path / "turn.json"
+    from hermes_cli import quiet_single_query as qsq_mod
+    monkeypatch.setenv(qsq_mod.TURN_REPORT_FILE_ENV, str(report))
+    monkeypatch.setenv(qsq_mod.TURN_REPORT_NONCE_ENV, "n0nce-abc123")
+    assert qsq_mod.take_turn_report_path() == str(report)
+    # The path is popped so nothing the turn spawns inherits it; the nonce is taken with it.
+    assert os.environ.get(qsq_mod.TURN_REPORT_FILE_ENV) is None
+    assert qsq_mod.take_turn_report_nonce() == "n0nce-abc123"
+    # A child that writes its report without naming the nonce still echoes the token it was given.
+    monkeypatch.setenv(qsq_mod.TURN_REPORT_NONCE_ENV, "n0nce-abc123")
+    qsq_mod.write_turn_report(str(report), exit_code=0, reply="ok")
+    assert qsq_mod.read_turn_report(str(report), nonce="n0nce-abc123") is not None
+    # A DIFFERENT spawner's token is refused, even though the record's pid matches.
+    assert qsq_mod.read_turn_report(str(report), os.getpid(), nonce="someone-elses") is None
+    assert qsq_mod.read_turn_report(str(report), os.getpid() + 1) is None
 
 
 def test_a_follow_up_turn_rewrites_the_report_with_the_answer_it_displaces(monkeypatch, tmp_path):

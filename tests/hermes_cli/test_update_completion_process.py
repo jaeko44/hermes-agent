@@ -80,7 +80,7 @@ def transition(tmp_path):
         "refuse_foreign_owned_venv = lambda root: None\n"
         "from pathlib import Path\n"
         "import os\n"
-        "def arm_completion(root):\n"
+        "def arm_completion(root, *, fresh=False, origin=None):\n"
         "    path = Path(os.environ['HERMES_HOME']) / 'completion-pending'\n"
         "    path.write_text('owed')\n"
         "    return path\n"
