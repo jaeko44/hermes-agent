@@ -837,6 +837,79 @@ def _run_bot_chat_turn(argv: list, env: dict, report_path: str, timeout: float) 
                              cwd=env.get("HERMES_HOME") or None)
 
 
+def _bot_chat_resume_banner(stream) -> str:
+    """The child's own proof that it GOT INTO the canonical Bot Chat session, or "".
+
+    ``-Q`` prints the resume banner to stderr the moment it has resumed the named session
+    (cli_agent_setup_mixin.py:614-617) — i.e. BEFORE the turn's first inference. That is the
+    one startup-progress marker the delivery child emits, which is what makes it usable as
+    the discriminator: its ABSENCE means the child never acquired the session at all, and its
+    presence means the session was acquired and the wall cut a turn that had already started.
+    """
+    for line in (stream or "").splitlines():
+        text = line.strip().lstrip("↻ ").strip()
+        for prefix in _BOT_CHAT_BANNER_PREFIXES:
+            if text.startswith(prefix):
+                return text
+    return ""
+
+
+def _bot_chat_wall_diagnosis(wall) -> tuple:
+    """Tell a BUSY target session from a DEAD delivery leg on one wall cut, or ``("", "")``.
+
+    WHY (fleet-engineer t_e0203ba6). Every wall cut booked ONE sentence — "bot-chat delivery to
+    profile '<p>' timed out after <N>s (...)" — regardless of which of two very different
+    things happened, so the two were indistinguishable in ``last_delivery_error`` and both
+    filed as ``delivery_failed``/``timed_out``:
+
+      * the target session was BUSY and the child WORKED in it until the cap cut the turn
+        (measured: web-frontend b7a51473e237, child in the canonical session 5s after spawn,
+        0% silent startup, cut at 1800s); the delivery leg is ALIVE and the remedy is a
+        bounded turn or a bigger cap — nothing about the leg is broken;
+      * the child never got into the session at all (measured on this host: 11 offense
+        executions lost 30%-185% of their wall BEFORE their first turn — secops 185%,
+        upstream-watch 93%, docs-scribe 79%, test-guard 64%); the delivery LEG is blocked and
+        the cap is not the story.
+
+    The two had different remedies and one label, which is the class this closes: the leg-dead
+    half was actioned as a timeout tweak and the busy half as a broken delivery path.
+
+    THE SIGNAL. The spawner stamps the child's own streams onto the exception it raises
+    (``quiet_single_query.run_reported_turn``), and the resume banner is the child's proof of
+    having acquired the target session. Read it and the condition is decided by the CHILD,
+    not by a guess about the fleet's schedules. Three outcomes, and the third is real:
+
+      ``session_busy`` the child reached the session and was working when the cap cut it;
+      ``leg_dead``     it produced nothing at all — never acquired the session;
+      ``unverified``   the kill landed but a grandchild still held the pipe, so its output
+                       could NOT be read. NOT the same as silence, and never filed as it.
+
+    Fail-closed to ``unverified``: a wall cut this function cannot read must stay loud rather
+    than be filed under either remedy.
+    """
+    if getattr(wall, "startup_seen", None) is not True:
+        return "unverified", ("the delivery child's output could not be read at the kill "
+                              "(a grandchild still held its pipe), so whether it had reached "
+                              "the target session is UNKNOWN")
+    stderr = getattr(wall, "stderr", None)
+    stdout = getattr(wall, "stdout", None)
+    banner = _bot_chat_resume_banner(stderr)
+    if banner:
+        said = _bot_chat_answer_text(stdout or "").strip()
+        tail = ("; its last output was %r" % said[-160:]) if said else \
+               "; it produced no answer before the cap"
+        return "session_busy", (
+            "the child DID acquire the target session (%s) and was working in it when the "
+            "cap cut the turn%s — the delivery leg is ALIVE and the cap, not the path, is "
+            "what stopped it" % (banner, tail))
+    if (stderr or stdout or "").strip():
+        return "unverified", ("the child produced output but never reported having resumed "
+                              "the target session, so its state at the cut is UNKNOWN")
+    return "leg_dead", ("the child was killed before it resumed or opened a turn in the "
+                        "target Bot Chat session — the delivery LEG never got going, and "
+                        "raising the cap cannot change that")
+
+
 def _format_failure_streams(result) -> str:
     """Exit code plus labeled, redacted stderr/stdout tails for a failed delivery turn.
 
@@ -1063,11 +1136,37 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
                 f". Details: {tail}")
         logger.info("Job '%s': delivered to Bot Chat of profile '%s'", job_id, profile_label)
         return None
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as wall:
+        # A wall cut is NOT one condition (t_e0203ba6). Diagnose it from the child's OWN
+        # evidence and book a sentence that NAMES which one it was, so `delivery_failed` can
+        # no longer hide a dead delivery leg behind a "session busy" reading — or the other
+        # way round. The two have different remedies: a busy target session needs a bounded
+        # turn or a bigger cap, a dead leg needs neither.
+        #
+        # FIRST, the forgiveness: a turn that ENDED at the wall (its own report on disk, with
+        # a non-empty answer) already reached Bot Chat, so it is booked delivered — the same
+        # rule the exit path applies, on the path that used to be the one booking it blind
+        # (t_9d87174e). The wall now carries the attribution the rule demands, so this is
+        # reachable rather than decorative.
+        if _bot_chat_turn_reported_a_digest(wall, report_file if query_file else None):
+            logger.info(
+                "Job '%s': bot-chat delivery to profile '%s' ended at its turn bound and "
+                "posted a summary; booking it delivered", job_id, profile_label)
+            return None
+        wall_kind, wall_why = _bot_chat_wall_diagnosis(wall)
+        logger.warning(
+            "Job '%s': bot-chat delivery to profile '%s' cut at the %ss wall - %s: %s",
+            job_id, profile_label, timeout_s, wall_kind, wall_why)
         # Replaying the full payload risks a duplicate (the killed turn may already have
         # persisted it); staying silent loses the alert entirely (2026-09-19 docgen-deadman
         # case). So queue a SHORT marker that points at the saved output, once per execution
         # (stable key); the re-mark guard reads the record's ``degraded`` flag, never the text.
+        #
+        # The marker is queued for EVERY condition, including a dead leg: it is a durable,
+        # keyed, drainable record, and suppressing it for one condition would make that
+        # condition the one that loses the alert — the docgen-deadman regression, reached
+        # through a fix for a different class. The diagnosis below tells a reader WHICH
+        # failure to act on; it does not decide whether the alert survives.
         marker_queued = False
         if not (deferred or {}).get("degraded"):
             marker = (
@@ -1097,8 +1196,9 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
             "if this keeps happening")
         return _fail(
             f"bot-chat delivery to profile '{profile_label}' timed out "
-            f"after {timeout_s}s ({hint}; raise "
-            "cron.bot_chat_delivery_timeout_seconds if this recurs)")
+            f"after {timeout_s}s [{wall_kind}] ({wall_why}; {hint}; raise "
+            "cron.bot_chat_delivery_timeout_seconds only for session_busy — for leg_dead the "
+            "cap is not the problem)")
     except Exception as e:
         logger.warning(
             "Job '%s': bot-chat delivery to profile '%s' failed: %s", job_id, profile_label,

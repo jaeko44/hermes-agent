@@ -227,7 +227,28 @@ def run_reported_turn(argv: list, *, env: MutableMapping[str, str], report_path:
             report = read_turn_report(report_path, proc.pid, nonce=nonce)
             if report is not None:
                 break
-            raise subprocess.TimeoutExpired(argv, timeout)
+            exc = subprocess.TimeoutExpired(argv, timeout)
+            # ATTRIBUTE THE WALL TO THIS RUN (t_9d87174e / t_e0203ba6). A bare exception is
+            # booked blind downstream: the delivery lane's booking rule forgives a cut turn
+            # only when it can prove the turn REPORTED itself, and it refuses a result with
+            # ``returncode == 0`` and one with no report path + nonce — so an unstamped
+            # TimeoutExpired is refused before any report is read, and a child cut at the wall
+            # with its digest already in Bot Chat is booked a delivery failure. The spawner is
+            # the only place that can stamp this, and it already holds all four facts.
+            exc.returncode = proc.returncode if proc.returncode is not None else -1
+            exc.report_file = report_path
+            exc.report_nonce = nonce
+            exc.child_pid = proc.pid
+            # WHAT THE CHILD MANAGED TO SAY, which is the only thing at this instant that
+            # tells a BUSY target session from a DEAD delivery leg (t_e0203ba6). It is free:
+            # the kill closed the pipes, so what the drain captured IS the child's whole
+            # output. ``None`` — never "" — when the drain thread is still blocked, because a
+            # grandchild can hold the pipe open past the kill: "we could not read it" must
+            # never be booked as "it said nothing".
+            exc.startup_seen = not drain.is_alive()
+            exc.stdout = streams.get("out") if exc.startup_seen else None
+            exc.stderr = streams.get("err") if exc.startup_seen else None
+            raise exc
     # Turn over, child still lingering for a nested reply: not this spawner's wait.
     return _booked(int(report["exit_code"]), report.get("reply") or "", report.get("error") or "")
 
