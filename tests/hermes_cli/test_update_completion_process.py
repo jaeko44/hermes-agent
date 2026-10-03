@@ -21,7 +21,18 @@ def transition(tmp_path):
     home.mkdir()
     package = root / "hermes_cli"
     package.mkdir()
-    (package / "__init__.py").write_text("")
+    # The real hermes_cli/__init__.py imports _ensure_utf8(), which forces UTF-8 stdio so a
+    # failure marker like "✗ ..." cannot die on a cp1252 console. The completion child runs
+    # -I -S and prints such markers, so an EMPTY stub removes that repair and the child dies
+    # with UnicodeEncodeError instead of reporting its real exit status.
+    (package / "__init__.py").write_text(
+        "import sys\n"
+        "for _stream in (sys.stdout, sys.stderr):\n"
+        "    try:\n"
+        "        _stream.reconfigure(encoding='utf-8', errors='replace')\n"
+        "    except Exception:\n"
+        "        pass\n"
+    )
     pm_package = root / "pm"
     pm_package.mkdir()
     (pm_package / "__init__.py").write_text("OLD_API = True\n")
@@ -89,7 +100,10 @@ def transition(tmp_path):
     )
     (package / "source_build.py").write_text(
         "from hermes_cli.probe import event\n"
-        "def build_update_products(root, *, desktop): event('build', desktop=desktop)\n"
+        # desktop_optional is part of the call contract since 97d60d4e06e9 (the decided
+        # --desktop-optional behaviour): complete_source_checkout always passes it, so a
+        # stub without the keyword raises TypeError and masks the real tail behaviour.
+        "def build_update_products(root, *, desktop, desktop_optional=False): event('build', desktop=desktop)\n"
     )
     (package / "source_stamp.py").write_text(
         "from hermes_cli.probe import event\n"
@@ -224,6 +238,13 @@ def test_missing_child_result_fails_boundary_receipt_and_releases_lock(transitio
     monkeypatch.setattr(main, "_update_preflight_handled", lambda args: False)
     monkeypatch.setattr(main, "_install_hangup_protection", lambda **kw: None)
     monkeypatch.setattr(main, "_finalize_update_output", lambda state: None)
+    # cmd_update's first act is retarget_to_owning_install(): from a foreign interpreter it
+    # reads the REAL install's inputs/.project-root (tests/home_io_guard.py refuses that read)
+    # or re-runs the real `hermes` there. Neither belongs to this test; stub it as
+    # tests/hermes_cli/test_update_existing_branch_baseline.py does. This is the process
+    # boundary, so owning_install_root's real behaviour stays covered by its own tests.
+    monkeypatch.setattr(
+        "hermes_cli.update_owning_install.retarget_to_owning_install", lambda *_: None)
 
     def complete(args, gateway_mode):
         update_receipt.begin_update_receipt()
@@ -263,6 +284,10 @@ def test_interrupt_after_child_success_demotes_gateway_marker_at_boundary(transi
     monkeypatch.setattr(main, "_update_preflight_handled", lambda args: False)
     monkeypatch.setattr(main, "_install_hangup_protection", lambda **kw: None)
     monkeypatch.setattr(main, "_finalize_update_output", lambda state: None)
+    # See the note in test_missing_child_result_fails_boundary_receipt_and_releases_lock:
+    # the process boundary is stubbed, not the behaviour under test.
+    monkeypatch.setattr(
+        "hermes_cli.update_owning_install.retarget_to_owning_install", lambda *_: None)
     interrupted = False
     cleanup_error = (OSError("retained-handle kill failed") if cleanup_failure == "kill"
                      else subprocess.TimeoutExpired("completion", 5))
@@ -382,6 +407,10 @@ def test_prepare_failure_preserves_correlated_pm_receipt(transition, monkeypatch
     monkeypatch.setattr(main, "_update_preflight_handled", lambda args: False)
     monkeypatch.setattr(main, "_install_hangup_protection", lambda **kw: None)
     monkeypatch.setattr(main, "_finalize_update_output", lambda state: None)
+    # See the note in test_missing_child_result_fails_boundary_receipt_and_releases_lock:
+    # the process boundary is stubbed, not the behaviour under test.
+    monkeypatch.setattr(
+        "hermes_cli.update_owning_install.retarget_to_owning_install", lambda *_: None)
 
     def complete(args, gateway_mode):
         update_receipt.begin_update_receipt()
