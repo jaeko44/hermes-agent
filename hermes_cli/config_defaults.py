@@ -1898,6 +1898,11 @@ DEFAULT_CONFIG = {
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
         # crashed) for the same task/profile. Reassignment resets the streak.
         "failure_limit": 2,
+        # Wall applied to a 'running' task whose own max_runtime_seconds is NULL.
+        # NULL is the absence of a per-card decision, not "unlimited" - without a
+        # fallback the reaper skips the card entirely and it holds its concurrency
+        # slot for the life of the host. An explicit per-task limit always wins.
+        "default_max_runtime_seconds": 3900,
         # Worker stdout/stderr log rotation at spawn time (2 MiB + one backup). Raise to keep more
         # early failure evidence from long-running workers.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,

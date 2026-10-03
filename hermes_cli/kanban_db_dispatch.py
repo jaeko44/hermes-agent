@@ -44,6 +44,14 @@ DEFAULT_LOG_BACKUP_COUNT = 1
 # before max_runtime_seconds kills it.
 KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = 30
 
+# Wall for a ``running`` card whose own ``max_runtime_seconds`` is NULL. NULL is
+# not "unlimited": it is the absence of a per-card decision, and treating it as
+# infinite lets such a card hold a concurrency slot for the life of the host
+# (measured 2026-10-01: one card at 21h with heartbeats current, unreapable
+# because the reaper's SELECT skipped NULL). Override per install with
+# ``kanban.default_max_runtime_seconds``.
+DEFAULT_MAX_RUNTIME_SECONDS = 3900  # 65m
+
 # A healthy worker is still alive for a while after kanban_complete /
 # kanban_request_review returns (final assistant turn, session persistence), so
 # a run's retained worker is only reaped once ended_at is at least this old
@@ -645,6 +653,29 @@ def heartbeat_worker(
     return True
 
 
+def _default_max_runtime_seconds() -> int:
+    """Wall applied to a ``running`` card whose ``max_runtime_seconds`` is NULL.
+
+    Reads ``kanban.default_max_runtime_seconds`` from config; falls back to
+    :data:`DEFAULT_MAX_RUNTIME_SECONDS` when unset or unparseable. Only the
+    NULL case consults this - an explicit per-card limit always wins.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get(
+            "default_max_runtime_seconds")
+    except Exception:
+        raw = None
+    if raw is not None:
+        try:
+            ival = int(raw)
+        except (TypeError, ValueError):
+            ival = 0
+        if ival > 0:
+            return ival
+    return DEFAULT_MAX_RUNTIME_SECONDS
+
+
 def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
@@ -663,7 +694,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
+        "WHERE t.status = 'running' "
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
@@ -674,7 +705,15 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         # Runtime is per attempt: ``tasks.started_at`` records the FIRST start,
         # so retries must be measured from the active task_runs row.
         elapsed = now - int(row["active_started_at"])
-        limit = int(row["max_runtime_seconds"])
+        # A NULL ``max_runtime_seconds`` is not "unlimited" - it means the card
+        # predates (or bypassed) the wall default, and excluding it from this
+        # SELECT made such a card hold its concurrency slot forever: no timeout,
+        # no reclaim, no event. Fall back to the configured default so every
+        # running card is reaped on some wall.
+        limit = row["max_runtime_seconds"]
+        limit = int(limit) if limit is not None else _default_max_runtime_seconds()
+        if limit <= 0:
+            continue
         if elapsed < limit:
             continue
 
