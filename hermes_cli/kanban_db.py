@@ -1378,6 +1378,8 @@ def create_task(
                 # Grade the path the row will ACTUALLY store, i.e. AFTER the
                 # project materialisation above. See the placement note above:
                 # refusing before it broke every project-scoped card.
+                # The guard now also names a leftover `kind:` scheme prefix, but
+                # it is CALLED through the landed alias -- see the import note.
                 kbw_require_spawnable_workspace_path(
                     workspace_path, kind=workspace_kind, where="kanban create",
                 )
@@ -4525,6 +4527,16 @@ from hermes_cli.kanban_db_workspace import (  # noqa: E402
     _scratch_workspace,
 )
 from hermes_cli.kanban_db_workspace import (  # noqa: E402
+    # KEEP THE ALIASED IMPORT NAME. This exact spelling is a LANDED CONTRACT that
+    # the estate asserts by name: bin/verify-workspace-path-creation.py grades
+    # "kbw_require_spawnable_workspace_path(" appearing in create_task, and
+    # bin/falsify-relative-workspace-create.py uses it as FIX_SYMBOLS to prove a
+    # sandbox really is pre-fix. Measured 2026-10-03 (t_wswriteguard01): renaming
+    # the call site to `require_absolute_workspace_path(` turns that guard RED
+    # 38/40 -- and RED for the WRONG reason, because the store is unchanged and
+    # every row is clean, so the operator is told "a card with a relative
+    # workspace_path is reachable again" when nothing regressed. A rename that a
+    # source-text guard cannot follow is a self-inflicted outage in the guard lane.
     require_spawnable_workspace_path as kbw_require_spawnable_workspace_path,
 )
 from hermes_cli.kanban_db_dispatch import (  # noqa: E402
