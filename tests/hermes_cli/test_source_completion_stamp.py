@@ -30,7 +30,7 @@ def _repo(tmp_path: Path) -> Path:
 
 def _completion_dependencies(monkeypatch, maintenance):
     monkeypatch.setattr("hermes_cli.venv_sync.publish_launchers", lambda root: None)
-    monkeypatch.setattr("hermes_cli.source_build.build_update_products", lambda root, *, desktop: None)
+    monkeypatch.setattr("hermes_cli.source_build.build_update_products", lambda root, **kw: None)
     monkeypatch.setattr("hermes_cli.update_cmd_maint._run_post_update_maintenance", maintenance)
 
 
